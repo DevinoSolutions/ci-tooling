@@ -2984,3 +2984,9 @@ def test_r5b_an_unknown_input_is_still_not_guessed_at(tmp_path):
 )
 def test_r5b_case_labels_and_quoted_text(body, runs_bun):
     assert lint._runs_bun(body) is runs_bun
+
+
+def test_reusable_workflow_passes_the_base_to_the_linter():
+    """Without `--base` the linter ignores `.github/ci-lint-baseline` and lints whole files."""
+    text = (CI_LINT_DIR.parents[1] / ".github" / "workflows" / "ci-lint.yml").read_text(encoding="utf-8")
+    assert '--base "$BASE_SHA"' in text
