@@ -10,8 +10,8 @@
 # deleted in one sweep.
 #
 # NO SECRETS. The reusable workflow lives in the PUBLIC DevinoSolutions/ci-tooling
-# repository and fetches its linter from there anonymously, so there is no
-# `secrets:` block and no token to provision. The same caller works in private
+# repository and fetches its linter from there anonymously, so nothing needs
+# passing and no token needs provisioning. The same caller works in private
 # and public repositories: the workflow picks `ubuntu-devino` (self-hosted) for
 # a private caller and `ubuntu-latest` (GitHub-hosted) for a public one.
 #
