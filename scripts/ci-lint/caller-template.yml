@@ -1,0 +1,39 @@
+# DevinoSolutions rails — ci-lint caller. Copied verbatim into each repo as
+# .github/workflows/ci-lint.yml by scripts/ci-lint/apply-caller.sh.
+#
+# WHY A CALLER AND NOT A RULESET. The org-wide way to run this is a repository
+# ruleset with a `workflows` rule pointing at the reusable workflow. Rulesets
+# are a paid GitHub feature and the org is on the Free plan, so the API refuses
+# to create one. This caller is the interim: the same lint runs on every pull
+# request and fails the check, it just cannot be *required* until the plan
+# allows it. When the ruleset lands, these callers become redundant and can be
+# deleted in one sweep.
+#
+# NO SECRETS. The reusable workflow lives in the PUBLIC DevinoSolutions/ci-tooling
+# repository and fetches its linter from there anonymously, so nothing needs
+# passing and no token needs provisioning. The same caller works in private
+# and public repositories: the workflow picks `ubuntu-devino` (self-hosted) for
+# a private caller and `ubuntu-latest` (GitHub-hosted) for a public one.
+#
+# THE CONCURRENCY GROUP MUST NOT MATCH THE CALLED WORKFLOW'S. `github.workflow`
+# resolves to THIS workflow's name on both sides of a `uses:` call, so writing
+# `ci-lint-${{ github.workflow }}-...` in both places puts the caller and the
+# workflow it calls in one group and the run cancels itself. The two prefixes
+# below and in the reusable ci-lint.yml are deliberately different, and neither
+# uses `github.workflow`. Dropping the block here instead would trip the lint's
+# own missing-concurrency rule on the very PR that adds this file.
+name: ci-lint
+
+on:
+  pull_request:
+
+concurrency:
+  group: ci-lint-caller-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ !contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.ref) }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci-lint:
+    uses: DevinoSolutions/ci-tooling/.github/workflows/ci-lint.yml@main

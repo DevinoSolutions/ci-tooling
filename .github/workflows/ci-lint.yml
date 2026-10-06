@@ -1,0 +1,155 @@
+# DevinoSolutions rails — org CI lint (spec 4.3).
+#
+# The regression guard for Track 1. W1-W4 remove duplicate runs, dead
+# workflows and repeated builds from the fleet; this workflow is what stops the
+# next PR from putting them back. It runs the rules in
+# `scripts/ci-lint/lint.py` over the workflow files a PR touches:
+#
+#   docker-build         a step that builds a container image in CI
+#   missing-concurrency  a push/pull_request workflow with no top-level
+#                        `concurrency:` block
+#   nightly-runner       a scheduled workflow whose jobs are not on
+#                        `ubuntu-devino-nightly`
+#   caller-permissions   a job calling a reusable workflow without holding the
+#                        permissions that workflow declares, which fails the
+#                        whole run at startup with nothing to read
+#
+# WHY THIS LIVES IN A PUBLIC REPOSITORY. It used to live in the private
+# `DevinoSolutions/.github` and fetch its linter from there with a second
+# checkout that needed an org-wide read token secret. That secret was
+# never created, the default GITHUB_TOKEN of a caller cannot read another
+# private repository, and a public caller cannot call a workflow in a private
+# repository at all. So the workflow and the linter now sit in this public,
+# secret-free repository: every caller, private or public, can call the
+# workflow and check this repository out anonymously. No token, no secret.
+#
+# WHERE IT RUNS. `runs-on` follows the CALLER's visibility. `github.event` in a
+# called workflow is the caller's event payload, so `repository.private` is the
+# caller's. Private repos run on the self-hosted pool (`ubuntu-devino`); public
+# repos must not touch the self-hosted pool and use GitHub-hosted
+# `ubuntu-latest`, which is free for public repositories.
+#
+# `actions/checkout` with no `repository:` gets the repo under review, and
+# nothing from this repository is on disk, so the linter is fetched with a
+# second checkout. Inside this repository that checkout is skipped and the PR's
+# own copy of the linter is used, so a PR that changes a rule is checked by the
+# rule it changes.
+#
+# `on:` is `workflow_call` + `pull_request` (the second so this repository lints
+# its own workflows).
+#
+# BASELINE. `scripts/ci-lint/lint.py` decides the mode: a repo carrying
+# `.github/ci-lint-baseline` whose sha is an ancestor of the PR base is linted
+# on added lines only; every other repo is linted on whole changed files. See
+# scripts/ci-lint/README.md.
+name: ci-lint (org)
+
+on:
+  workflow_call:
+  pull_request:
+
+# NOT `github.workflow`. In a called workflow that expression resolves to the
+# CALLER's workflow name, so a caller writing the same group would land in this
+# one and the run would cancel itself. `github.repository` is unambiguous on
+# both sides, and the caller template deliberately uses a different prefix.
+concurrency:
+  group: ci-lint-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ !contains(fromJSON('["refs/heads/main","refs/heads/dev"]'), github.ref) }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci-lint:
+    name: workflow hygiene
+    runs-on: ${{ github.event.repository.private && 'ubuntu-devino' || 'ubuntu-latest' }}
+    # Not about the work — the linter is milliseconds. This is the fleet
+    # prologue: checkout peaked at 259s under pool contention.
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository under review
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # The baseline check is `merge-base --is-ancestor`, and the diff is
+          # `base...HEAD`. Both need real history, not a shallow clone.
+          fetch-depth: 0
+
+      - name: Check out the linter from DevinoSolutions/ci-tooling
+        if: github.repository != 'DevinoSolutions/ci-tooling'
+        # This repository is public, so the default token (and even no token)
+        # can read it. No org secret is involved.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DevinoSolutions/ci-tooling
+          ref: main
+          path: .ci-lint-tooling
+          persist-credentials: false
+
+      - name: Locate the linter
+        id: tooling
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REPOSITORY" = "DevinoSolutions/ci-tooling" ]; then
+            echo 'dir=scripts/ci-lint' >> "$GITHUB_OUTPUT"
+          else
+            echo 'dir=.ci-lint-tooling/scripts/ci-lint' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify the linter is present
+        env:
+          LINT_DIR: ${{ steps.tooling.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$LINT_DIR/lint.py" ]; then
+            echo "::error::ci-lint tooling missing at $LINT_DIR. The checkout of DevinoSolutions/ci-tooling (public) should have provided it."
+            exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+          # This repo has no packaging; do not fail the post-run cache save.
+          ignore-nothing-to-cache: true
+
+      - name: Resolve the diff base
+        id: base
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="$PR_BASE_SHA"
+          if [ -z "$base" ]; then
+            base="$PUSH_BEFORE"
+          fi
+          # `github.event.before` is all-zeros on a branch's first push, and a
+          # force-push can name a commit that is no longer reachable.
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+            echo "::notice::no usable event base; falling back to ${base}"
+          fi
+          echo "sha=${base}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect the workflow files this change touches
+        id: changed
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git diff --name-only --diff-filter=ACMR "${BASE_SHA}...HEAD" -- .github/workflows > ci-lint-changed.txt
+          count="$(wc -l < ci-lint-changed.txt | tr -d ' ')"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "${count} changed workflow file(s) against ${BASE_SHA}"
+          cat ci-lint-changed.txt
+
+      - name: Lint
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          LINT_DIR: ${{ steps.tooling.outputs.dir }}
+        run: |
+          set -euo pipefail
+          uv run --no-project --with pyyaml==6.0.2 python "$LINT_DIR/lint.py" \
+            --repo-root . \
+            --base "$BASE_SHA" \
+            --paths-from ci-lint-changed.txt \
+            --summary-file "$GITHUB_STEP_SUMMARY"

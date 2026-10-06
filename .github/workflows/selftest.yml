@@ -1,0 +1,31 @@
+# Unit tests for the ci-lint linter. The suite builds throwaway git repositories
+# in tmp and drives `git diff` and `merge-base --is-ancestor` for real, so it
+# runs on a real runner. This repository is public: GitHub-hosted runners, never
+# the self-hosted pool.
+name: selftest
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: selftest-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+          ignore-nothing-to-cache: true
+      - name: pytest
+        run: uv run --no-project --with pytest --with pyyaml==6.0.2 python -m pytest scripts/ci-lint -q
