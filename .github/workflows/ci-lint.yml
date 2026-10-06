@@ -150,5 +150,6 @@ jobs:
           set -euo pipefail
           uv run --no-project --with pyyaml==6.0.2 python "$LINT_DIR/lint.py" \
             --repo-root . \
+            --base "$BASE_SHA" \
             --paths-from ci-lint-changed.txt \
             --summary-file "$GITHUB_STEP_SUMMARY"

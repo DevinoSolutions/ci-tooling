@@ -2990,3 +2990,9 @@ def test_reusable_workflow_passes_the_base_to_the_linter():
     """Without `--base` the linter ignores `.github/ci-lint-baseline` and lints whole files."""
     text = (CI_LINT_DIR.parents[1] / ".github" / "workflows" / "ci-lint.yml").read_text(encoding="utf-8")
     assert '--base "$BASE_SHA"' in text
+
+
+def test_reusable_workflow_passes_the_base_to_the_linter():
+    """Without `--base` the linter ignores `.github/ci-lint-baseline` and lints whole files."""
+    text = (CI_LINT_DIR.parents[1] / ".github" / "workflows" / "ci-lint.yml").read_text(encoding="utf-8")
+    assert '--base "$BASE_SHA"' in text
