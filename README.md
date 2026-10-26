@@ -13,6 +13,8 @@ internal hostnames, no credentials. Keep it that way.
 |---|---|
 | `.github/workflows/ci-lint.yml` | The reusable `workflow_call` that every repo calls |
 | `scripts/ci-lint/` | The linter (`lint.py`), its tests, the caller template and the adoption script. Start with its README |
+| `.github/workflows/agent-surface.yml` | Reusable nightly check that a repo's PRODUCTION site still serves the agent surfaces (llms.txt, Markdown twins, security.txt, api-catalog, AI-crawler robots) |
+| `scripts/agent-surface/` | The checker (`check.py`), its tests and the caller template. See its README |
 
 ## Calling it
 

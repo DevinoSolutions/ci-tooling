@@ -1,0 +1,37 @@
+# DevinoSolutions rails — agent-surface caller. Copy into a repo as
+# .github/workflows/agent-surface.yml and set ORIGIN below (GetItDone T-5785).
+#
+# It probes the LIVE site every morning and on demand, never on a pull
+# request: the check reads production, so a PR cannot make it pass or fail.
+# A red run means production lost a surface AI assistants read; the step
+# summary names the URL and what it answered.
+#
+# `skip` exempts a check this app genuinely does not need, with the reason
+# after the colon (a bare name is refused). Examples:
+#   api-catalog: no public API or MCP server
+#   accept-markdown: Cloudflare caches the HTML, so negotiation would poison it
+#
+# The nightly leg must run on ubuntu-devino-nightly (org ci-lint rule
+# nightly-runner). A public repo passes runner: ubuntu-latest instead and adds
+# the ci-lint `allow-schedule-main` marker with its reason.
+name: agent-surface
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: agent-surface-caller-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  agent-surface:
+    uses: DevinoSolutions/ci-tooling/.github/workflows/agent-surface.yml@main
+    with:
+      origin: https://ORIGIN.example
+      runner: ubuntu-devino-nightly
+      skip: ''

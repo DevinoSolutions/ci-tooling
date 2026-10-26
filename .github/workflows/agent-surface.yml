@@ -1,0 +1,86 @@
+# DevinoSolutions rails — agent-surface contract check (GetItDone T-5785).
+#
+# Probes ONE production origin and fails when a surface AI assistants read is
+# missing: llms.txt, the /index.md twin, Accept: text/markdown negotiation (with
+# Vary: Accept), the Markdown alternate link, security.txt (RFC 9116), the
+# api-catalog (RFC 9727), robots.txt access for the assistant crawlers, and a
+# real 404 for an unknown twin. The rules and their messages live in
+# `scripts/agent-surface/check.py`; read its README for each one.
+#
+# It checks PRODUCTION, not the pull request, so callers run it on a schedule
+# and by hand (workflow_dispatch), never on pull_request: a red run means the
+# live site lost a surface, whoever caused it. A deploy that drops security.txt
+# shows up the next morning instead of weeks later.
+#
+# Same layout as ci-lint.yml: public, secret-free, and the checker is fetched
+# from this repository with an anonymous checkout. A scheduled caller passes
+# `runner: ubuntu-devino-nightly` (the org ci-lint nightly-runner rule); a
+# public caller passes `runner: ubuntu-latest`.
+name: agent-surface (org)
+
+on:
+  workflow_call:
+    inputs:
+      origin:
+        description: Production origin to probe, e.g. https://example.com
+        required: true
+        type: string
+      skip:
+        description: "Checks this app is exempt from, one `check: reason` per line or comma"
+        required: false
+        type: string
+        default: ''
+      runner:
+        description: Runner label. Empty picks ubuntu-devino for a private caller and ubuntu-latest for a public one.
+        required: false
+        type: string
+        default: ''
+  pull_request:
+    paths:
+      - .github/workflows/agent-surface.yml
+      - scripts/agent-surface/**
+
+# Not `github.workflow`: in a called workflow it is the caller's name (see ci-lint.yml).
+concurrency:
+  group: agent-surface-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  agent-surface:
+    name: agent-surface contract
+    # On a schedule `github.event.repository` is absent, so a scheduled caller
+    # must name its runner; the lint rule above already makes it.
+    runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'ubuntu-devino' || 'ubuntu-latest') }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out the checker from DevinoSolutions/ci-tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DevinoSolutions/ci-tooling
+          # Inside this repository an empty ref is the event's own commit, so a
+          # PR is checked by its own copy of the checker; callers get main.
+          ref: ${{ github.repository != 'DevinoSolutions/ci-tooling' && 'main' || '' }}
+          path: .agent-surface-tooling
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+          ignore-nothing-to-cache: true
+
+      - name: Probe the production origin
+        env:
+          # This repository's own PR run probes a site that passes every check
+          # today, so a change that breaks a check on real responses goes red here.
+          ORIGIN: ${{ inputs.origin != '' && inputs.origin || 'https://getuptimely.com' }}
+          SKIP: ${{ inputs.skip }}
+        run: |
+          set -euo pipefail
+          args=(--origin "$ORIGIN" --summary-file "$GITHUB_STEP_SUMMARY")
+          if [ -n "$SKIP" ]; then
+            args+=(--skip "$SKIP")
+          fi
+          uv run --no-project python .agent-surface-tooling/scripts/agent-surface/check.py "${args[@]}"
