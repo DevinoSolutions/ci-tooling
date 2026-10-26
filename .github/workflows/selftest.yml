@@ -28,4 +28,4 @@ jobs:
           python-version: '3.12'
           ignore-nothing-to-cache: true
       - name: pytest
-        run: uv run --no-project --with pytest --with pyyaml==6.0.2 python -m pytest scripts/ci-lint -q
+        run: uv run --no-project --with pytest --with pyyaml==6.0.2 python -m pytest scripts/ci-lint scripts/agent-surface -q
