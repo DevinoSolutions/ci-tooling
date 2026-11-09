@@ -14,7 +14,10 @@
 #   FETCH_UV_VERSION    uv release, no leading v
 #   FETCH_UV_SHA256     sha256 of uv-x86_64-unknown-linux-gnu.tar.gz of that release
 #   FETCH_UV_ASSET_ID   GitHub release asset id of that tarball
-#   FETCH_UV_TOKEN      token for the asset API (optional; unauthenticated calls share 60/hour per IP)
+#   FETCH_UV_TOKEN      token for the asset API (optional; unauthenticated calls share 60/hour per IP).
+#                       Read once and unset, so no child process inherits it, and sent only to
+#                       https://api.github.com/ (the test server on 127.0.0.1 is the other exception)
+#   FETCH_UV_CACHE_KEY  the actions cache key, named in the warning when a cached tarball is bad
 #   FETCH_UV_CACHE_DIR  directory the actions cache restores and saves
 #   FETCH_UV_BIN_DIR    directory the binaries are extracted to, and added to GITHUB_PATH
 # Test-only overrides (the digest check still runs on whatever they serve):
@@ -26,6 +29,8 @@ version="${FETCH_UV_VERSION:?}"
 sha256="${FETCH_UV_SHA256:?}"
 asset_id="${FETCH_UV_ASSET_ID:?}"
 token="${FETCH_UV_TOKEN:-}"
+unset FETCH_UV_TOKEN
+cache_key="${FETCH_UV_CACHE_KEY:-}"
 cache_dir="${FETCH_UV_CACHE_DIR:?}"
 bin_dir="${FETCH_UV_BIN_DIR:?}"
 
@@ -50,7 +55,9 @@ source_used="cache"
 # A restored tarball is trusted only after it matches the pinned digest; a mismatch (stale key,
 # truncated save) is discarded and fetched again.
 if [ -f "$tarball" ] && ! matches_pin "$tarball"; then
-  echo "::warning::cached $asset does not match the pinned sha256; downloading it again"
+  # The entry is immutable and the restore hits it on every run, so it is downloaded again every
+  # run until someone deletes it.
+  echo "::warning::cached $asset does not match the pinned sha256; downloading it again. Delete the bad entry so the next run saves a good one: gh cache delete '${cache_key:-uv-linux-x86_64-*}' -R ${GITHUB_REPOSITORY:-<owner/repo>}"
   rm -f "$tarball"
 fi
 
@@ -77,8 +84,13 @@ if [ ! -f "$tarball" ]; then
 
   if [ "$source_used" = "api" ]; then
     # The token goes to curl on stdin as a config line, never on argv or into a log.
+    # The header goes only to GitHub's API. Anything else (a stray override) gets no credential.
+    case "$api_url" in
+      https://api.github.com/* | http://127.0.0.1:*) send_token=yes ;;
+      *) send_token=no ;;
+    esac
     {
-      if [ -n "$token" ]; then
+      if [ -n "$token" ] && [ "$send_token" = yes ]; then
         printf 'header = "Authorization: Bearer %s"\n' "$token"
       fi
     } | curl -fsSL -K - \
@@ -104,3 +116,21 @@ echo "uv ${version}: sha256 verified (source: ${source_used})"
 echo "source=${source_used}" >> "${GITHUB_OUTPUT:-/dev/null}"
 echo "$bin_dir" >> "${GITHUB_PATH:-/dev/null}"
 "$bin_dir/uv" --version
+
+# The runners ship a Python 3.12 in the tool cache, which uv does not search. On a hosted runner
+# whose system Python is not 3.12 (ubuntu-26.04 has 3.14), `UV_PYTHON=3.12` would otherwise make
+# uv download a managed CPython from github.com on every run: the same host that returned 504.
+# Putting the tool cache's 3.12 on PATH lets uv find it. Where there is none (the ARC pool has a
+# system 3.12 instead) nothing changes.
+# Highest 3.12.x wins (a plain glob sorts 3.12.3 after 3.12.16).
+python_bin="$(
+  for dir in "${RUNNER_TOOL_CACHE:-/nonexistent}"/Python/3.12.*/x64/bin; do
+    if [ -x "$dir/python3" ]; then
+      echo "$dir"
+    fi
+  done | sort -V | tail -n 1
+)"
+if [ -n "$python_bin" ]; then
+  echo "$python_bin" >> "${GITHUB_PATH:-/dev/null}"
+  echo "python 3.12 from the runner tool cache: $python_bin"
+fi

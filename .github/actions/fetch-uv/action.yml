@@ -6,11 +6,14 @@ description: >-
   astral-sh/setup-uv, whose download gives up after three tries.
 
 # Why a composite action: ci-lint.yml and selftest.yml use it, and a push to the default branch must
-# warm the cache in that branch's scope (warm-uv-cache.yml). A pull_request run restores from its
-# own refs/pull/N/merge scope and the base branch's; a save from a PR run is invisible to every
-# other PR, so the default branch saves and every PR restores. The cache belongs to the repository
-# the workflow runs in, so a repository calling the reusable ci-lint workflow warms its own scope
-# only if it also runs that workflow on a push to its default branch.
+# warm the cache in that branch's scope (selftest.yml runs on every push to main; warm-uv-cache.yml
+# re-warms by hand). A pull_request run restores from its own refs/pull/N/merge scope and the base
+# branch's; a save from a PR run is invisible to every other PR, so the default branch saves and
+# every PR restores. The cache belongs to the repository the workflow runs in. A repository calling
+# the reusable ci-lint workflow only has a warm default-branch scope if it also runs that workflow
+# on a push to its default branch, and the caller template does not. So a PR run in another
+# repository does not save (it would spend that repository's cache quota on an entry no other run
+# can read); its protection is the patient download and the API fallback.
 #
 # The download logic lives in fetch-uv.sh so scripts/ci-lint/tests/test_fetch_uv.py can drive it
 # against a local server.
@@ -66,15 +69,19 @@ runs:
         FETCH_UV_SHA256: ${{ inputs.sha256 }}
         FETCH_UV_ASSET_ID: ${{ inputs.asset-id }}
         FETCH_UV_TOKEN: ${{ inputs.token }}
+        FETCH_UV_CACHE_KEY: uv-linux-x86_64-${{ inputs.version }}-${{ inputs.sha256 }}
         FETCH_UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
         FETCH_UV_BIN_DIR: ${{ runner.temp }}/uv-bin
       run: bash "$GITHUB_ACTION_PATH/fetch-uv.sh"
 
     - name: Save uv tarball
       # Only after the digest check above passed (a failure there stops the action first).
-      # A PR run saves into its own scope, which is harmless; the default branch's save is the
-      # useful one.
-      if: steps.restore.outputs.cache-hit != 'true'
+      # Only where the entry can be read again: any push, and PR runs in this repository (whose
+      # default branch selftest warms). A PR run elsewhere would store an entry only that PR can
+      # read.
+      if: >-
+        steps.restore.outputs.cache-hit != 'true' &&
+        !(github.event_name == 'pull_request' && github.repository != 'DevinoSolutions/ci-tooling')
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/uv-cache

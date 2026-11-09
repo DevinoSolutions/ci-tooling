@@ -60,18 +60,23 @@ BAD = b"<html>502 Bad Gateway</html>"
 
 
 class Server:
-    """Serves /release and /api; each answers with a status and a body the test sets."""
+    """Serves /release, /api and /obj; each answers with a status, a body and headers the test sets."""
 
     def __init__(self) -> None:
-        self.routes: dict[str, tuple[int, bytes]] = {"/release": (504, b""), "/api": (504, b"")}
+        self.routes: dict[str, tuple[int, bytes] | tuple[int, bytes, dict[str, str]]] = {
+            "/release": (504, b""),
+            "/api": (504, b""),
+        }
         self.requests: list[tuple[str, dict[str, str]]] = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - http.server's name
                 outer.requests.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
-                status, body = outer.routes.get(self.path, (404, b""))
+                status, body, *rest = outer.routes.get(self.path, (404, b""))
                 self.send_response(status)
+                for name, value in (rest[0] if rest else {}).items():
+                    self.send_header(name, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -168,10 +173,108 @@ def test_a_504_from_github_falls_back_to_the_asset_api(tmp_path, server):
     assert run.leftovers() == ["uv-x86_64-unknown-linux-gnu.tar.gz"]
 
 
-def test_the_token_is_never_on_a_command_line():
-    text = SCRIPT.read_text()
-    assert "-K -" in text
-    assert not re.search(r"curl[^\n]*\$\{?token", text), "the token must reach curl on stdin only"
+def real_curl() -> str:
+    path = shutil.which("curl")
+    assert path
+    return Path(path).as_posix()
+
+
+def curl_shim(tmp: Path) -> tuple[Path, Path]:
+    """A `curl` that records its argv and its environment, then runs the real one."""
+    shim_dir = tmp / "shim"
+    shim_dir.mkdir()
+    log = tmp / "curl.log"
+    shim = shim_dir / "curl"
+    script = "\n".join(
+        [
+            "#!/bin/bash",
+            "{ printf 'ARG %s\\n' \"$@\"; env | sed 's/^/ENV /'; } >> \"" + log.as_posix() + '"',
+            'exec "' + real_curl() + '" "$@"',
+            "",
+        ]
+    )
+    shim.write_bytes(script.encode())
+    return shim_dir, log
+
+
+def test_the_token_reaches_curl_on_stdin_only(tmp_path, server):
+    server.routes["/api"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    shim_dir, log = curl_shim(tmp_path)
+    run.env["PATH"] = f"{shim_dir}{os.pathsep}{run.env['PATH']}"
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert run.source() == "api"
+    recorded = log.read_text()
+    assert f"ARG {server.base}/api" in recorded, "the shim must have seen the API call"
+    assert TOKEN not in recorded, "the token was on a curl command line or in its environment"
+    assert server.hits("/api")[0]["authorization"] == f"Bearer {TOKEN}", "it must still arrive"
+
+
+def test_the_token_is_not_sent_to_a_url_that_is_not_githubs_api(tmp_path, server):
+    server.routes["/api"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    run.env["FETCH_UV_API_URL"] = f"http://localhost:{server.httpd.server_address[1]}/api"
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    (headers,) = server.hits("/api")
+    assert "authorization" not in headers
+
+
+def test_the_token_does_not_follow_a_redirect_to_another_host(tmp_path, server):
+    # The real API answers 302 to a CDN host. `localhost` and `127.0.0.1` are different hosts to curl.
+    other = Server()
+    other.routes["/obj"] = (200, GOOD)
+    other.thread.start()
+    try:
+        server.routes["/api"] = (302, b"", {"Location": f"http://localhost:{other.httpd.server_address[1]}/obj"})
+        run = Run(tmp_path, server)
+        done = run.go()
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert run.source() == "api"
+        assert server.hits("/api")[0]["authorization"] == f"Bearer {TOKEN}"
+        (redirected,) = other.hits("/obj")
+        assert "authorization" not in redirected
+    finally:
+        other.httpd.shutdown()
+        other.httpd.server_close()
+
+
+def test_the_runner_tool_cache_python_312_is_put_on_path(tmp_path, server):
+    server.routes["/release"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    tool_cache = tmp_path / "toolcache"
+    for version in ("3.12.3", "3.12.16", "3.13.1"):
+        bin_dir = tool_cache / "Python" / version / "x64" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "python3").write_bytes(b"#!/bin/sh\n")
+        (bin_dir / "python3").chmod(0o755)
+    run.env["RUNNER_TOOL_CACHE"] = tool_cache.as_posix()
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    on_path = run.path_file.read_text().splitlines()
+    assert (tool_cache / "Python" / "3.12.16" / "x64" / "bin").as_posix() in on_path
+    assert not any("3.13.1" in line or "3.12.3" in line for line in on_path)
+
+
+def test_without_a_tool_cache_python_312_only_uv_is_added_to_path(tmp_path, server):
+    server.routes["/release"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    run.env["RUNNER_TOOL_CACHE"] = (tmp_path / "empty").as_posix()
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert run.path_file.read_text().splitlines() == [run.bin.as_posix()]
+
+
+def test_a_bad_cached_tarball_warning_names_the_key_to_delete(tmp_path, server):
+    server.routes["/release"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    run.env["FETCH_UV_CACHE_KEY"] = "uv-linux-x86_64-0.0.0-test-abc"
+    run.cache.mkdir()
+    (run.cache / "uv-x86_64-unknown-linux-gnu.tar.gz").write_bytes(BAD)
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "gh cache delete 'uv-linux-x86_64-0.0.0-test-abc'" in done.stdout + done.stderr
 
 
 def test_a_primary_body_that_misses_the_digest_falls_back_to_the_api(tmp_path, server):

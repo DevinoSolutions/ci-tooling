@@ -67,8 +67,10 @@ jobs:
     # prologue: checkout peaked at 259s under pool contention.
     timeout-minutes: 15
     env:
-      # What setup-uv's `python-version: '3.12'` exported. uv finds the runner's 3.12 (and would
-      # download one only if there is none).
+      # What setup-uv's `python-version: '3.12'` exported. uv searches PATH, not the runner tool
+      # cache, so the fetch-uv action puts the tool cache's 3.12 on PATH. Without that a hosted
+      # ubuntu-26.04 runner (system Python 3.14) downloads a managed CPython from github.com on
+      # every run, the host this change exists to survive. The ARC pool has a system 3.12.
       UV_PYTHON: '3.12'
       # pyyaml comes from PyPI at `uv run` time. uv retries 5xx and timeouts itself; the defaults
       # (3 tries, 30 s) are what a 504 burst outlasts.
