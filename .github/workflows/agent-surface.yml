@@ -55,21 +55,34 @@ jobs:
     # must name its runner; the lint rule above already makes it.
     runs-on: ${{ inputs.runner != '' && inputs.runner || (github.event.repository.private && 'ubuntu-devino' || 'ubuntu-latest') }}
     timeout-minutes: 10
+    env:
+      # What setup-uv's `python-version: '3.12'` exported (see ci-lint.yml for why fetch-uv links the
+      # tool cache's 3.12).
+      UV_PYTHON: '3.12'
     steps:
       - name: Check out the checker from DevinoSolutions/ci-tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: DevinoSolutions/ci-tooling
           # Inside this repository an empty ref is the event's own commit, so a
-          # PR is checked by its own copy of the checker; callers get main.
+          # PR is checked by its own copy of the checker; callers get main. Not
+          # the workflow's own commit: see the note on the tooling checkout in
+          # ci-lint.yml (`github.job_workflow_sha` is empty in a called workflow).
           ref: ${{ github.repository != 'DevinoSolutions/ci-tooling' && 'main' || '' }}
           path: .agent-surface-tooling
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: '3.12'
-          ignore-nothing-to-cache: true
+      # Not astral-sh/setup-uv: its download gives up after three tries and github.com has answered
+      # 504 for longer (see ci-lint.yml). fetch-uv caches, retries patiently, falls back to the
+      # release-asset API and checks a pinned sha256. Inside this repository the action is the PR's
+      # own; for a caller it comes from the checker checkout above.
+      - name: Fetch uv
+        if: github.repository == 'DevinoSolutions/ci-tooling'
+        uses: ./.github/actions/fetch-uv
+
+      - name: Fetch uv
+        if: github.repository != 'DevinoSolutions/ci-tooling'
+        uses: ./.agent-surface-tooling/.github/actions/fetch-uv
 
       - name: Probe the production origin
         env:
