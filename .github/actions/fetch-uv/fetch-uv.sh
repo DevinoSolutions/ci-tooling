@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Put the pinned uv release binary in $FETCH_UV_BIN_DIR, from the cache directory when a verified
+# tarball is already there, from github.com when not, and from the GitHub asset API when
+# github.com keeps failing. The tarball is checked against a pinned sha256 on every path, and an
+# unverified file is never extracted and never left where the cache save would store it.
+#
+# Why this exists: astral-sh/setup-uv downloads uv with @actions/tool-cache, which gives up after
+# three tries (about 40 seconds). github.com/<owner>/<repo>/releases/download/... answered 504 for
+# well over that on 2026-11-08 and 2026-11-09, and every ci-lint run that hit it went red before
+# the linter started. The API asset URL 302s to the same CDN object but skips the github.com
+# redirect hop that failed, so it is the fallback.
+#
+# Inputs (environment, so nothing secret is ever on a command line):
+#   FETCH_UV_VERSION    uv release, no leading v
+#   FETCH_UV_SHA256     sha256 of uv-x86_64-unknown-linux-gnu.tar.gz of that release
+#   FETCH_UV_ASSET_ID   GitHub release asset id of that tarball
+#   FETCH_UV_TOKEN      token for the asset API (optional; unauthenticated calls share 60/hour per IP)
+#   FETCH_UV_CACHE_DIR  directory the actions cache restores and saves
+#   FETCH_UV_BIN_DIR    directory the binaries are extracted to, and added to GITHUB_PATH
+# Test-only overrides (the digest check still runs on whatever they serve):
+#   FETCH_UV_PRIMARY_URL, FETCH_UV_API_URL, FETCH_UV_RETRY_DELAY, FETCH_UV_RETRY_MAX_TIME,
+#   FETCH_UV_MAX_TIME, FETCH_UV_API_RETRY_MAX_TIME
+set -euo pipefail
+
+version="${FETCH_UV_VERSION:?}"
+sha256="${FETCH_UV_SHA256:?}"
+asset_id="${FETCH_UV_ASSET_ID:?}"
+token="${FETCH_UV_TOKEN:-}"
+cache_dir="${FETCH_UV_CACHE_DIR:?}"
+bin_dir="${FETCH_UV_BIN_DIR:?}"
+
+asset="uv-x86_64-unknown-linux-gnu.tar.gz"
+primary_url="${FETCH_UV_PRIMARY_URL:-https://github.com/astral-sh/uv/releases/download/${version}/${asset}}"
+api_url="${FETCH_UV_API_URL:-https://api.github.com/repos/astral-sh/uv/releases/assets/${asset_id}}"
+retry_delay="${FETCH_UV_RETRY_DELAY:-5}"
+retry_max_time="${FETCH_UV_RETRY_MAX_TIME:-60}"
+max_time="${FETCH_UV_MAX_TIME:-30}"
+api_retry_max_time="${FETCH_UV_API_RETRY_MAX_TIME:-120}"
+
+tarball="$cache_dir/$asset"
+partial="$tarball.part"
+mkdir -p "$cache_dir" "$bin_dir"
+
+matches_pin() {
+  echo "${sha256}  $1" | sha256sum -c - >/dev/null 2>&1
+}
+
+source_used="cache"
+
+# A restored tarball is trusted only after it matches the pinned digest; a mismatch (stale key,
+# truncated save) is discarded and fetched again.
+if [ -f "$tarball" ] && ! matches_pin "$tarball"; then
+  echo "::warning::cached $asset does not match the pinned sha256; downloading it again"
+  rm -f "$tarball"
+fi
+
+if [ ! -f "$tarball" ]; then
+  rm -f "$partial"
+
+  # --max-time bounds each attempt (a 504 can take ~2 minutes to arrive, a stalled transfer would
+  # otherwise hang to the job timeout); a healthy download takes about a second. Only about a
+  # minute is spent here before the API fallback, which serves the same object and is checked
+  # against the same digest. --retry-all-errors also retries a failed connection or a DNS error,
+  # which plain --retry (408/429/5xx and timeouts only) does not.
+  source_used="release"
+  if ! curl -fsSL --max-time "$max_time" --connect-timeout 20 \
+    --retry 40 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time "$retry_max_time" \
+    -o "$partial" "$primary_url"; then
+    echo "::warning::release download of uv ${version} failed; falling back to the GitHub asset API"
+    rm -f "$partial"
+    source_used="api"
+  elif ! matches_pin "$partial"; then
+    echo "::warning::release download of uv ${version} does not match the pinned sha256; falling back to the GitHub asset API"
+    rm -f "$partial"
+    source_used="api"
+  fi
+
+  if [ "$source_used" = "api" ]; then
+    # The token goes to curl on stdin as a config line, never on argv or into a log.
+    {
+      if [ -n "$token" ]; then
+        printf 'header = "Authorization: Bearer %s"\n' "$token"
+      fi
+    } | curl -fsSL -K - \
+      --max-time 60 --connect-timeout 20 \
+      --retry 5 --retry-all-errors --retry-delay "$retry_delay" --retry-max-time "$api_retry_max_time" \
+      -H "Accept: application/octet-stream" -o "$partial" "$api_url"
+  fi
+
+  # Fail closed: nothing that misses the pinned digest is extracted or moved into the cache
+  # directory, whichever path it came from.
+  if ! matches_pin "$partial"; then
+    echo "::error::uv ${version} ($source_used) does not match the pinned sha256 ${sha256}"
+    rm -f "$partial"
+    exit 1
+  fi
+  mv -f "$partial" "$tarball"
+fi
+
+tar -xz -C "$bin_dir" --strip-components=1 < "$tarball"
+chmod +x "$bin_dir/uv"
+
+echo "uv ${version}: sha256 verified (source: ${source_used})"
+echo "source=${source_used}" >> "${GITHUB_OUTPUT:-/dev/null}"
+echo "$bin_dir" >> "${GITHUB_PATH:-/dev/null}"
+"$bin_dir/uv" --version

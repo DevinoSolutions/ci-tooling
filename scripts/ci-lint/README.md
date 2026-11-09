@@ -539,3 +539,15 @@ needs none. The same caller works unchanged in private and public repos.
 
 [waitforimage]: https://github.com/DevinoSolutions/runner-infra/blob/main/docs/superpowers/specs/2026-09-10-ci-build-once-and-pool-design.md#55-ci-side-wait-for-image
 [pool]: https://github.com/DevinoSolutions/runner-infra/blob/main/docs/superpowers/specs/2026-09-10-ci-build-once-and-pool-design.md#44-nightlies-on-a-deprioritised-scale-set
+
+## How the workflow gets uv
+
+The reusable workflow does not use `astral-sh/setup-uv`: its download gives up after
+three tries, and github.com answered 504 for longer than that on 2026-11-08 and
+2026-11-09. `.github/actions/fetch-uv` restores a cached tarball, otherwise downloads
+the pinned release patiently (`curl --max-time 30 --retry 40 --retry-max-time 60`),
+falls back to the release-asset API (token on curl's stdin, never on a command line),
+and checks one pinned sha256 on every path before anything is extracted or cached.
+`warm-uv-cache.yml` saves the tarball in the default branch's cache scope. To upgrade
+uv, change the three pins in the action together (the action's header says where each
+comes from). `tests/test_fetch_uv.py` drives the script against a local server.

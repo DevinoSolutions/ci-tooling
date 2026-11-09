@@ -1,0 +1,37 @@
+# Warm the actions cache with the pinned uv tarball (see .github/actions/fetch-uv).
+#
+# A pull_request run restores from its own scope and the default branch's, and a save from a PR
+# run is invisible to every other PR. So the default branch saves, and every PR run here restores
+# instead of downloading. The save happens inside the action right after the sha256 check, so a
+# later failure cannot lose it; this job is only where a push to the default branch reaches it.
+# workflow_dispatch re-warms after an eviction (GitHub drops entries unused for 7 days).
+#
+# This warms ci-tooling's own scope. A repository calling the reusable ci-lint workflow has its
+# own cache scope; it is warm there once its default branch has run the workflow (a push trigger).
+name: warm-uv-cache
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: warm-uv-cache-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    name: warm uv cache
+    # Public repository: GitHub-hosted runners, never the self-hosted pool.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - name: Fetch uv
+        uses: ./.github/actions/fetch-uv

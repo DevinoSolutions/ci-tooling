@@ -1,0 +1,81 @@
+name: Fetch uv
+description: >-
+  Put the pinned uv release on PATH, from the actions cache when it is there and from GitHub when it
+  is not (github.com first, then the release-asset API). The tarball is checked against a pinned
+  sha256 on every path, and an unverified file is never extracted or cached. Replaces
+  astral-sh/setup-uv, whose download gives up after three tries.
+
+# Why a composite action: ci-lint.yml and selftest.yml use it, and a push to the default branch must
+# warm the cache in that branch's scope (warm-uv-cache.yml). A pull_request run restores from its
+# own refs/pull/N/merge scope and the base branch's; a save from a PR run is invisible to every
+# other PR, so the default branch saves and every PR restores. The cache belongs to the repository
+# the workflow runs in, so a repository calling the reusable ci-lint workflow warms its own scope
+# only if it also runs that workflow on a push to its default branch.
+#
+# The download logic lives in fetch-uv.sh so scripts/ci-lint/tests/test_fetch_uv.py can drive it
+# against a local server.
+#
+# Linux x86_64 only: that is the one tarball pinned below. Any other runner fails loudly rather
+# than installing an unverified binary.
+#
+# Upgrading uv: change all three pins together. sha256 is the line for
+# uv-x86_64-unknown-linux-gnu.tar.gz in that release's `.sha256` file; asset-id is that tarball's
+# id in `gh api repos/astral-sh/uv/releases/tags/<version> --jq '.assets[]|[.name,.id]|@tsv'`.
+
+inputs:
+  version:
+    description: uv release (no leading v)
+    default: "0.13.7"
+  sha256:
+    description: sha256 of the uv-x86_64-unknown-linux-gnu.tar.gz of that release
+    default: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83"
+  asset-id:
+    description: GitHub release asset id of that tarball (api.github.com/repos/astral-sh/uv/releases/assets/<id>)
+    default: "704009823"
+  token:
+    description: Token for the asset API (unauthenticated calls share 60/hour per runner IP)
+    default: ${{ github.token }}
+
+outputs:
+  source:
+    description: Where the verified tarball came from (cache, release or api)
+    value: ${{ steps.fetch.outputs.source }}
+
+runs:
+  using: composite
+  steps:
+    - name: Require a Linux x86_64 runner
+      if: runner.os != 'Linux' || runner.arch != 'X64'
+      shell: bash
+      run: |
+        echo "::error::fetch-uv pins the x86_64 Linux uv tarball; this runner is ${RUNNER_OS}/${RUNNER_ARCH}"
+        exit 1
+
+    - name: Restore uv tarball
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/uv-cache
+        key: uv-linux-x86_64-${{ inputs.version }}-${{ inputs.sha256 }}
+
+    - name: Download and verify uv
+      id: fetch
+      shell: bash
+      env:
+        FETCH_UV_VERSION: ${{ inputs.version }}
+        FETCH_UV_SHA256: ${{ inputs.sha256 }}
+        FETCH_UV_ASSET_ID: ${{ inputs.asset-id }}
+        FETCH_UV_TOKEN: ${{ inputs.token }}
+        FETCH_UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
+        FETCH_UV_BIN_DIR: ${{ runner.temp }}/uv-bin
+      run: bash "$GITHUB_ACTION_PATH/fetch-uv.sh"
+
+    - name: Save uv tarball
+      # Only after the digest check above passed (a failure there stops the action first).
+      # A PR run saves into its own scope, which is harmless; the default branch's save is the
+      # useful one.
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/uv-cache
+        key: uv-linux-x86_64-${{ inputs.version }}-${{ inputs.sha256 }}

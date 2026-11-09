@@ -21,11 +21,14 @@ jobs:
     name: pytest
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      UV_PYTHON: '3.12'
+      UV_HTTP_RETRIES: '10'
+      UV_HTTP_TIMEOUT: '60'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: '3.12'
-          ignore-nothing-to-cache: true
+      # The same action the reusable ci-lint workflow runs, so every PR here exercises it.
+      - name: Fetch uv
+        uses: ./.github/actions/fetch-uv
       - name: pytest
         run: uv run --no-project --with pytest --with pyyaml==6.0.2 python -m pytest scripts/ci-lint scripts/agent-surface -q

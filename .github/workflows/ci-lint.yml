@@ -66,6 +66,14 @@ jobs:
     # Not about the work — the linter is milliseconds. This is the fleet
     # prologue: checkout peaked at 259s under pool contention.
     timeout-minutes: 15
+    env:
+      # What setup-uv's `python-version: '3.12'` exported. uv finds the runner's 3.12 (and would
+      # download one only if there is none).
+      UV_PYTHON: '3.12'
+      # pyyaml comes from PyPI at `uv run` time. uv retries 5xx and timeouts itself; the defaults
+      # (3 tries, 30 s) are what a 504 burst outlasts.
+      UV_HTTP_RETRIES: '10'
+      UV_HTTP_TIMEOUT: '60'
     steps:
       - name: Check out the repository under review
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -105,11 +113,18 @@ jobs:
             exit 1
           fi
 
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: '3.12'
-          # This repo has no packaging; do not fail the post-run cache save.
-          ignore-nothing-to-cache: true
+      # Not astral-sh/setup-uv: its download gives up after three tries, and github.com answered
+      # 504 for longer than that on 2026-11-08 and 2026-11-09 (sendly PRs went red before the
+      # linter ran). fetch-uv restores a cached tarball, downloads patiently, falls back to the
+      # release-asset API, and checks one pinned sha256 on every path. Inside this repository the
+      # action is the PR's own; for a caller it comes from the tooling checkout above.
+      - name: Fetch uv
+        if: github.repository == 'DevinoSolutions/ci-tooling'
+        uses: ./.github/actions/fetch-uv
+
+      - name: Fetch uv
+        if: github.repository != 'DevinoSolutions/ci-tooling'
+        uses: ./.ci-lint-tooling/.github/actions/fetch-uv
 
       - name: Resolve the diff base
         id: base
