@@ -92,6 +92,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: DevinoSolutions/ci-tooling
+          # The tooling is checked out at `main`, not at the commit this workflow was loaded from, because a
+          # called workflow cannot learn that commit: `github.job_workflow_sha` is empty in a called
+          # workflow's steps (probed on a private caller on ubuntu-devino, 2026-11-09; it exists only as
+          # an OIDC claim, which needs the id-token permission, and the run API's `referenced_workflows` needs
+          # `actions: read`, neither of which callers grant). So a caller pinning `@<sha>` still gets
+          # main's tooling, and a run that straddles a merge to main can pair workflow N with tooling N+1.
+          # Keep workflow and tooling changes compatible both ways round.
           ref: main
           path: .ci-lint-tooling
           persist-credentials: false

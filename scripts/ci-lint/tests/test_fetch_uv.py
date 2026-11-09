@@ -409,7 +409,7 @@ def test_the_pins_in_the_action_are_well_formed():
     assert sha and asset and version, "version, sha256 and asset-id must all be pinned by default"
 
 
-@pytest.mark.parametrize("workflow", ["ci-lint.yml", "selftest.yml"])
+@pytest.mark.parametrize("workflow", ["ci-lint.yml", "selftest.yml", "agent-surface.yml"])
 def test_the_workflows_do_not_go_back_to_setup_uv(workflow):
     text = (REPO_ROOT / ".github" / "workflows" / workflow).read_text()
     uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)", text, re.M)
