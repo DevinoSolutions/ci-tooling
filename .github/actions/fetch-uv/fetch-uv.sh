@@ -86,6 +86,9 @@ if [ ! -f "$tarball" ]; then
     # The token goes to curl on stdin as a config line, never on argv or into a log.
     # The header goes only to GitHub's API. Anything else (a stray override) gets no credential.
     case "$api_url" in
+      # Userinfo (`http://127.0.0.1:1@other-host/`) would let the second arm match a URL curl sends
+      # to another host.
+      *@*) send_token=no ;;
       https://api.github.com/* | http://127.0.0.1:*) send_token=yes ;;
       *) send_token=no ;;
     esac
@@ -117,20 +120,25 @@ echo "source=${source_used}" >> "${GITHUB_OUTPUT:-/dev/null}"
 echo "$bin_dir" >> "${GITHUB_PATH:-/dev/null}"
 "$bin_dir/uv" --version
 
-# The runners ship a Python 3.12 in the tool cache, which uv does not search. On a hosted runner
-# whose system Python is not 3.12 (ubuntu-26.04 has 3.14), `UV_PYTHON=3.12` would otherwise make
-# uv download a managed CPython from github.com on every run: the same host that returned 504.
-# Putting the tool cache's 3.12 on PATH lets uv find it. Where there is none (the ARC pool has a
-# system 3.12 instead) nothing changes.
-# Highest 3.12.x wins (a plain glob sorts 3.12.3 after 3.12.16).
-python_bin="$(
-  for dir in "${RUNNER_TOOL_CACHE:-/nonexistent}"/Python/3.12.*/x64/bin; do
-    if [ -x "$dir/python3" ]; then
-      echo "$dir"
-    fi
-  done | sort -V | tail -n 1
-)"
-if [ -n "$python_bin" ]; then
-  echo "$python_bin" >> "${GITHUB_PATH:-/dev/null}"
-  echo "python 3.12 from the runner tool cache: $python_bin"
+# uv searches PATH for a Python, not the runner tool cache. On a hosted runner whose system Python
+# is not 3.12 (ubuntu-26.04 has 3.14), `UV_PYTHON=3.12` would otherwise make uv download a managed
+# CPython from github.com on every run: the same host that returned 504. So when no python3.12 is on
+# PATH (a system one, or one a caller put there with setup-python, is left alone) and the tool cache
+# has a finished 3.12 install, link just its python3.12 into the uv bin dir. Only that name: the
+# job's `python`, `python3` and `pip` stay what they were. The ARC pool's image has both a system
+# 3.12 and a tool-cache one; there the system one is found first and nothing is linked.
+if ! command -v python3.12 >/dev/null 2>&1; then
+  # Highest 3.12.x wins (a plain glob sorts 3.12.3 after 3.12.16). `x64.complete` is the tool
+  # cache's mark of a finished install.
+  python_bin="$(
+    for dir in "${RUNNER_TOOL_CACHE:-/nonexistent}"/Python/3.12.*/x64/bin; do
+      if [ -f "$dir/../../x64.complete" ] && [ -x "$dir/python3.12" ]; then
+        echo "$dir"
+      fi
+    done | sort -V | tail -n 1
+  )"
+  if [ -n "$python_bin" ]; then
+    ln -sf "$python_bin/python3.12" "$bin_dir/python3.12"
+    echo "python 3.12 from the runner tool cache: $python_bin/python3.12"
+  fi
 fi

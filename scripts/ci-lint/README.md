@@ -550,9 +550,9 @@ falls back to the release-asset API (token on curl's stdin, never on a command l
 and checks one pinned sha256 on every path before anything is extracted or cached.
 `selftest.yml` saves the tarball in the default branch's cache scope on every push to
 main (`warm-uv-cache.yml` re-warms it by hand); a PR run in another repository does not
-save, because only that PR could read the entry. The action also puts the runner's
-tool-cache Python 3.12 on PATH, so uv does not download a CPython from github.com on a
-hosted runner whose system Python is newer. To upgrade uv, change the three pins in the
+save, because only that PR could read the entry. When no `python3.12` is on PATH, the action
+also links the runner's tool-cache `python3.12` (only that name) into its bin dir, so uv
+does not download a CPython from github.com on a hosted runner whose system Python is newer. To upgrade uv, change the three pins in the
 action together (the action's header says where each comes from; selftest checks they
 describe one real release asset). `tests/test_fetch_uv.py` drives the script against a
 local server.

@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -19,6 +21,26 @@ import yaml
 
 ACTION = Path(__file__).resolve().parents[2] / ".github" / "actions" / "fetch-uv" / "action.yml"
 TARBALL = "uv-x86_64-unknown-linux-gnu.tar.gz"
+
+
+ATTEMPTS = 3
+
+
+def fetch(request: urllib.request.Request) -> dict:
+    """GET the asset, retrying a network error or a 5xx; a 4xx is a wrong pin and fails at once."""
+    for attempt in range(1, ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as err:
+            if err.code < 500 or attempt == ATTEMPTS:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == ATTEMPTS:
+                raise
+        print(f"::warning::asset API call failed (attempt {attempt}/{ATTEMPTS}); retrying")
+        time.sleep(2**attempt)
+    raise AssertionError("unreachable")
 
 
 def main() -> int:
@@ -34,8 +56,7 @@ def main() -> int:
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(request, timeout=30) as response:
-        asset = json.load(response)
+    asset = fetch(request)
 
     problems = []
     if asset.get("name") != TARBALL:

@@ -104,6 +104,17 @@ def server():
     srv.httpd.server_close()
 
 
+def path_without_python312() -> str:
+    """The ambient PATH minus every directory holding a `python3.12`, so the script's "is one on
+    PATH already?" answer comes from the test and not from the machine it runs on. (selftest.yml's
+    own earlier step links one into a directory on PATH.)"""
+    kept = [d for d in os.environ["PATH"].split(os.pathsep) if not shutil.which("python3.12", path=d)]
+    path = os.pathsep.join(kept)
+    if not all(shutil.which(tool, path=path) for tool in ("bash", "curl", "sha256sum", "tar", "sort", "tail")):
+        pytest.skip("the system python3.12 lives in a directory the script's tools also need")
+    return path
+
+
 class Run:
     def __init__(self, tmp: Path, srv: Server, sha: str = GOOD_SHA) -> None:
         self.cache = tmp / "uv-cache"
@@ -125,6 +136,8 @@ class Run:
             FETCH_UV_RETRY_MAX_TIME="2",
             FETCH_UV_API_RETRY_MAX_TIME="2",
             FETCH_UV_MAX_TIME="5",
+            PATH=path_without_python312(),
+            RUNNER_TOOL_CACHE=(tmp / "no-toolcache").as_posix(),
             GITHUB_OUTPUT=self.output.as_posix(),
             GITHUB_PATH=self.path_file.as_posix(),
         )
@@ -222,6 +235,19 @@ def test_the_token_is_not_sent_to_a_url_that_is_not_githubs_api(tmp_path, server
     assert "authorization" not in headers
 
 
+def test_the_token_is_not_sent_through_a_userinfo_url(tmp_path, server):
+    # curl reads `127.0.0.1:1` here as user:password and connects to `localhost`, so a prefix match
+    # on `http://127.0.0.1:` alone would hand the token to another host.
+    server.routes["/api"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    run.env["FETCH_UV_API_URL"] = f"http://127.0.0.1:1@localhost:{server.httpd.server_address[1]}/api"
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    (headers,) = server.hits("/api")
+    assert TOKEN not in str(headers)
+    assert not headers.get("authorization", "").startswith("Bearer")
+
+
 def test_the_token_does_not_follow_a_redirect_to_another_host(tmp_path, server):
     # The real API answers 302 to a CDN host. `localhost` and `127.0.0.1` are different hosts to curl.
     other = Server()
@@ -241,29 +267,76 @@ def test_the_token_does_not_follow_a_redirect_to_another_host(tmp_path, server):
         other.httpd.server_close()
 
 
-def test_the_runner_tool_cache_python_312_is_put_on_path(tmp_path, server):
+def tool_cache_python(tool_cache: Path, version: str, complete: bool = True) -> Path:
+    bin_dir = tool_cache / "Python" / version / "x64" / "bin"
+    bin_dir.mkdir(parents=True)
+    for name in ("python3", "python3.12", "pip"):
+        (bin_dir / name).write_bytes(b"#!/bin/sh\n")
+        (bin_dir / name).chmod(0o755)
+    if complete:
+        (tool_cache / "Python" / version / "x64.complete").write_bytes(b"")
+    return bin_dir
+
+
+def linked_python(run: Run) -> Path:
+    return run.bin / "python3.12"
+
+
+def test_the_tool_cache_python_312_is_linked_by_name_only(tmp_path, server):
     server.routes["/release"] = (200, GOOD)
     run = Run(tmp_path, server)
     tool_cache = tmp_path / "toolcache"
-    for version in ("3.12.3", "3.12.16", "3.13.1"):
-        bin_dir = tool_cache / "Python" / version / "x64" / "bin"
-        bin_dir.mkdir(parents=True)
-        (bin_dir / "python3").write_bytes(b"#!/bin/sh\n")
-        (bin_dir / "python3").chmod(0o755)
+    tool_cache_python(tool_cache, "3.12.3")
+    newest = tool_cache_python(tool_cache, "3.12.16")
+    tool_cache_python(tool_cache, "3.13.1")
     run.env["RUNNER_TOOL_CACHE"] = tool_cache.as_posix()
     done = run.go()
     assert done.returncode == 0, done.stdout + done.stderr
-    on_path = run.path_file.read_text().splitlines()
-    assert (tool_cache / "Python" / "3.12.16" / "x64" / "bin").as_posix() in on_path
-    assert not any("3.13.1" in line or "3.12.3" in line for line in on_path)
+    assert linked_python(run).exists()
+    assert f"python 3.12 from the runner tool cache: {newest.as_posix()}/python3.12" in done.stdout
+    if linked_python(run).is_symlink():
+        assert Path(os.readlink(linked_python(run))) == newest / "python3.12"
+    # Nothing else of the job's PATH changes: python, python3 and pip stay what they were.
+    assert run.path_file.read_text().splitlines() == [run.bin.as_posix()]
+    assert not (run.bin / "python3").exists() and not (run.bin / "pip").exists()
 
 
-def test_without_a_tool_cache_python_312_only_uv_is_added_to_path(tmp_path, server):
+def test_an_unfinished_tool_cache_install_is_ignored(tmp_path, server):
     server.routes["/release"] = (200, GOOD)
     run = Run(tmp_path, server)
-    run.env["RUNNER_TOOL_CACHE"] = (tmp_path / "empty").as_posix()
+    tool_cache = tmp_path / "toolcache"
+    finished = tool_cache_python(tool_cache, "3.12.4")
+    tool_cache_python(tool_cache, "3.12.99", complete=False)
+    run.env["RUNNER_TOOL_CACHE"] = tool_cache.as_posix()
     done = run.go()
     assert done.returncode == 0, done.stdout + done.stderr
+    assert f"{finished.as_posix()}/python3.12" in done.stdout
+    assert "3.12.99" not in done.stdout
+
+
+def test_a_python_312_already_on_path_is_left_alone(tmp_path, server):
+    server.routes["/release"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    tool_cache = tmp_path / "toolcache"
+    tool_cache_python(tool_cache, "3.12.16")
+    run.env["RUNNER_TOOL_CACHE"] = tool_cache.as_posix()
+    system = tmp_path / "system-bin"
+    system.mkdir()
+    (system / "python3.12").write_bytes(b"#!/bin/sh\n")
+    (system / "python3.12").chmod(0o755)
+    run.env["PATH"] = f"{system}{os.pathsep}{run.env['PATH']}"
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not linked_python(run).exists()
+    assert "runner tool cache" not in done.stdout
+
+
+def test_without_a_tool_cache_python_312_nothing_is_linked(tmp_path, server):
+    server.routes["/release"] = (200, GOOD)
+    run = Run(tmp_path, server)
+    done = run.go()
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not linked_python(run).exists()
     assert run.path_file.read_text().splitlines() == [run.bin.as_posix()]
 
 

@@ -40,11 +40,12 @@ jobs:
           case "$found" in
             */uv/python/*) echo "::error::uv resolved a managed (downloaded) Python: $found"; exit 1 ;;
           esac
+      - name: pytest
+        run: uv run --no-project --with pytest --with pyyaml==6.0.2 python -m pytest scripts/ci-lint scripts/agent-surface -q
       # A bumped version or sha with a stale asset id would break only the API fallback, and only
-      # while github.com is down. Check the three pins against the release itself.
+      # while github.com is down. Check the three pins against the release itself. After pytest, so
+      # an API blip cannot hide the test results.
       - name: The uv pins describe one real release asset
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: uv run --no-project --with pyyaml==6.0.2 python scripts/ci-lint/check_uv_pin.py
-      - name: pytest
-        run: uv run --no-project --with pytest --with pyyaml==6.0.2 python -m pytest scripts/ci-lint scripts/agent-surface -q
