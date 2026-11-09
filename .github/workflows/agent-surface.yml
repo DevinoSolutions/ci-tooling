@@ -74,14 +74,10 @@ jobs:
 
       # Not astral-sh/setup-uv: its download gives up after three tries and github.com has answered
       # 504 for longer (see ci-lint.yml). fetch-uv caches, retries patiently, falls back to the
-      # release-asset API and checks a pinned sha256. Inside this repository the action is the PR's
-      # own; for a caller it comes from the checker checkout above.
+      # release-asset API and checks a pinned sha256. This job never checks out the repository root,
+      # so the action always comes from the checker checkout above (the PR's own copy in this
+      # repository, main for a caller).
       - name: Fetch uv
-        if: github.repository == 'DevinoSolutions/ci-tooling'
-        uses: ./.github/actions/fetch-uv
-
-      - name: Fetch uv
-        if: github.repository != 'DevinoSolutions/ci-tooling'
         uses: ./.agent-surface-tooling/.github/actions/fetch-uv
 
       - name: Probe the production origin
