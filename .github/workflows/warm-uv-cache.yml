@@ -1,0 +1,34 @@
+# Warm the actions cache with the pinned uv tarball (see .github/actions/fetch-uv).
+#
+# Re-warms the pinned uv tarball in the default branch's cache scope by hand, for example after
+# an eviction (GitHub drops entries unused for 7 days). Normally nothing needs it: selftest.yml
+# runs the same action on every push to main and saves the entry, and a PR run restores from the
+# default branch's scope. A second run per push to main would only duplicate that.
+#
+# This is ci-tooling's own scope only. A repository calling the reusable ci-lint workflow has its
+# own cache, which nothing here touches.
+name: warm-uv-cache
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: warm-uv-cache-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    name: warm uv cache
+    # Public repository: GitHub-hosted runners, never the self-hosted pool.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - name: Fetch uv
+        uses: ./.github/actions/fetch-uv
