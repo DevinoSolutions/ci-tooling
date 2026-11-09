@@ -194,6 +194,7 @@ def curl_shim(tmp: Path) -> tuple[Path, Path]:
         ]
     )
     shim.write_bytes(script.encode())
+    shim.chmod(0o755)
     return shim_dir, log
 
 
