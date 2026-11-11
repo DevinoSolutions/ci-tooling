@@ -16,9 +16,11 @@ ruleset, so that the savings W1-W4 land are not undone by the next PR.
                               the permissions that workflow declares, which
                               fails the run at startup with nothing to read
     R6  pnpm-store-cache      a self-hosted job whose `actions/setup-node`
-                              restores the pnpm cache (`cache: pnpm`, or v5's
-                              automatic pnpm caching) over the store every pod
-                              on the node shares, racing concurrent installs
+                              restores the pnpm or npm cache (`cache: pnpm|npm`,
+                              or v5's automatic pnpm caching), or whose
+                              `actions/cache` step caches the shared store path
+                              (`/var/cache/ci`, `pnpm store path`, ...), over the
+                              store every pod on the node shares
 
 WHY LINE NUMBERS, NOT JUST FILES. Adoption is incremental: a repo drops a
 `.github/ci-lint-baseline` file naming the sha at which it was migrated, and
@@ -915,6 +917,64 @@ def _cache_names_pnpm(value) -> bool:
     return value.strip().lower() == "pnpm"
 
 
+def _cache_names_npm(value) -> bool:
+    """True when a `cache:` input is npm: `npm config get cache` answers /var/cache/ci/npm on the pool."""
+    if not isinstance(value, str):
+        return False
+    if is_expression(value):
+        return any(label.strip().lower() == "npm" for label in _expression_labels(value))
+    return value.strip().lower() == "npm"
+
+
+# An `actions/cache` step whose `path:` is the node's shared package store. Same hazard as
+# setup-node's `cache:`, spelled by hand: a save uploads the whole shared store, a restore
+# extracts it over files sibling pods are hard-linking out of. On 2026-11-11 such a restore
+# rewrote ~340k files in the forth store and left six CAS names holding another file's bytes.
+_ACTIONS_CACHE_RE = re.compile(r"^actions/cache(?:/(?:restore|save))?@")
+# A path that names the shared hostPath directly, or the env var pnpm/npm read it from. A
+# workspace-local `.pnpm-store` or `~/.local/share/pnpm` is not shared on the pool, so it is not matched.
+_STORE_PATH_LITERAL_RE = re.compile(r"/var/cache/ci|npm_config_store_dir|npm_config_cache", re.I)
+# A command whose answer IS the shared store on the pool (the env points pnpm/npm at it).
+_STORE_QUERY_RE = re.compile(
+    r"\bpnpm\s+(?:store\s+path|config\s+get\s+store-dir)\b|\bnpm\s+config\s+get\s+cache\b"
+)
+_STEP_OUTPUT_REF_RE = re.compile(r"steps\.([A-Za-z0-9_-]+)\.outputs\.")
+_ENV_NAME_REF_RE = re.compile(r"(?:\benv\.|\$\{?)([A-Za-z_][A-Za-z0-9_]*)")
+_ASSIGNED_NAME_RE = re.compile(r"""(?m)(?:^|[\s;"'])([A-Za-z_][A-Za-z0-9_]*)=""")
+
+
+def _store_cache_step_cause(step: dict, earlier: list, doc: dict, job: dict) -> str | None:
+    """Why this `actions/cache` step's `path:` is the shared store, or None when it is not."""
+    inputs = step.get("with") if isinstance(step.get("with"), dict) else {}
+    path = inputs.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return None
+    literal = _STORE_PATH_LITERAL_RE.search(path)
+    if literal is not None:
+        first = path.strip().splitlines()[0]
+        return f"caches `path: {first}`, which names the shared store (`{literal.group(0)}`)"
+    query_ids: set[str] = set()
+    store_names: set[str] = set()
+    for scope in (doc.get("env"), job.get("env"), step.get("env")):
+        if isinstance(scope, dict):
+            for key, value in scope.items():
+                if isinstance(value, str) and _STORE_PATH_LITERAL_RE.search(value):
+                    store_names.add(str(key))
+    for prior in earlier:
+        run = prior.get("run") if isinstance(prior, dict) else None
+        if isinstance(run, str) and _STORE_QUERY_RE.search(run):
+            if isinstance(prior.get("id"), str):
+                query_ids.add(prior["id"])
+            store_names.update(_ASSIGNED_NAME_RE.findall(run))
+    for ref in _STEP_OUTPUT_REF_RE.findall(path):
+        if ref in query_ids:
+            return f"caches the output of step `{ref}`, which runs `pnpm store path` / `npm config get cache`"
+    for ref in _ENV_NAME_REF_RE.findall(path):
+        if ref in store_names:
+            return f"caches `${ref}`, which is set from the shared store path"
+    return None
+
+
 def _auto_cache_enabled(value) -> bool:
     """setup-node reads `(input || 'true').toUpperCase() === 'TRUE'`; an expression is unknown."""
     if value is None:
@@ -966,17 +1026,36 @@ def _pnpm_cache_findings(
         steps = job.get("steps")
         if not isinstance(steps, list):
             continue
-        for step in steps:
+        for position, step in enumerate(steps):
             if not isinstance(step, dict):
                 continue
             uses = step.get("uses")
-            if not isinstance(uses, str) or not _SETUP_NODE_RE.match(uses.strip()):
+            if not isinstance(uses, str):
                 continue
             inputs = step.get("with") if isinstance(step.get("with"), dict) else {}
             step_line = step.get(_NODE_START)
             uses_line = _key_line(step, "uses") or step_line
-            cache = inputs.get("cache")
-            if _cache_names_pnpm(cache):
+            shared = "pnpm store"
+            cache = None
+            if _ACTIONS_CACHE_RE.match(uses.strip()):
+                hand_cause = _store_cache_step_cause(step, steps[:position], doc, job)
+                if hand_cause is None:
+                    continue
+                line = _key_line(inputs, "path") or uses_line
+                cause = hand_cause
+                fix = (
+                    "Delete this `actions/cache` step. The pool's store is already warm at "
+                    "`/var/cache/ci/pnpm-store` (npm: `/var/cache/ci/npm`); `pnpm install "
+                    "--frozen-lockfile` reads it directly."
+                )
+                shared = "package store"
+            elif not _SETUP_NODE_RE.match(uses.strip()):
+                continue
+            else:
+                cache = inputs.get("cache")
+            if shared == "package store":
+                pass
+            elif _cache_names_pnpm(cache):
                 line = _key_line(inputs, "cache") or uses_line
                 cause = f"sets `cache: {cache}`"
                 fix = (
@@ -984,6 +1063,15 @@ def _pnpm_cache_findings(
                     "pool's pnpm store is already warm at `/var/cache/ci/pnpm-store`; "
                     "`pnpm install --frozen-lockfile` reads it directly."
                 )
+            elif _cache_names_npm(cache):
+                line = _key_line(inputs, "cache") or uses_line
+                cause = f"sets `cache: {cache}`"
+                fix = (
+                    "Delete `cache: npm` (and its `cache-dependency-path:`) from this step. The "
+                    "pool's npm cache is already warm at `/var/cache/ci/npm` "
+                    "(`npm_config_cache`); `npm ci` reads it directly."
+                )
+                shared = "npm cache"
             elif not (isinstance(cache, str) and cache.strip()):
                 raw = lines[uses_line - 1] if uses_line and uses_line <= len(lines) else ""
                 major = _setup_node_major(uses, raw)
@@ -1011,14 +1099,21 @@ def _pnpm_cache_findings(
             exemption = _marker_state(lines, [header_span, job_spans[index]], _ALLOW_PNPM_CACHE_RE)
             if exemption == "allowed":
                 continue
+            owner = "`actions/cache` step" if shared == "package store" else "`actions/setup-node` step"
             message = (
-                f"Job `{name}` runs on the self-hosted pool and its `actions/setup-node` step "
-                f"{cause}. Every runner pod on a node shares one pnpm store through the "
+                f"Job `{name}` runs on the self-hosted pool and its {owner} "
+                f"{cause}. Every runner pod on a node shares one {shared} through the "
                 "`/var/cache/ci` hostPath, so restoring the ~2 GB cache tarball over it races the "
                 "installs of concurrent jobs and fails them with "
                 "`ERR_PNPM_ENOENT ... copyfile /var/cache/ci/pnpm-store/v10/files/...`. The store "
                 "is already warm, so the restore buys nothing on this pool."
             )
+            if shared != "pnpm store":
+                message += (
+                    " A save also uploads the whole shared directory, and a restore of one can "
+                    "leave CAS names hard-linked to another file's bytes (a whole-store restore "
+                    "did exactly that on 2026-11-11)."
+                )
             if exemption == "no-reason":
                 message = (
                     f"Job `{name}` is marked with `# {WRITTEN_PNPM_CACHE_MARKER}` but no reason "

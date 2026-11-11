@@ -350,7 +350,8 @@ the shared lane immune.
 ### `pnpm-store-cache`
 
 A job on the self-hosted pool whose `actions/setup-node` step restores the
-pnpm cache is reported. Two shapes count:
+pnpm or npm cache, or whose `actions/cache` step caches the node's shared store,
+is reported. Four shapes count:
 
 - **`cache: pnpm`**, in any spelling, or as a branch of the one
   `${{ A && 'x' || 'y' }}` ternary the linter resolves; and
@@ -358,6 +359,18 @@ pnpm cache is reported. Two shapes count:
   pin whose comment says `# v5…`) with no `cache:` input,
   `package-manager-cache` left at its default, and a root `package.json` whose
   `packageManager` is `pnpm@…`.
+
+- **`cache: npm`**: `npm config get cache` answers `/var/cache/ci/npm` on the pool
+  (`npm_config_cache`), so the same tar restore/save hits the shared npm cache; and
+- **an `actions/cache` (or `/restore`, `/save`) step whose `path:`** names `/var/cache/ci`,
+  `npm_config_store_dir` or `npm_config_cache`, or is the output (`${{ steps.<id>.outputs.* }}`)
+  or env var (`${{ env.X }}`, `$X`) set from an earlier `pnpm store path` /
+  `pnpm config get store-dir` / `npm config get cache` step. A workspace-local `.pnpm-store`
+  is not shared and is not reported.
+
+A whole-store save uploads ~2 GB of the shared directory, and a later restore rewrites it in
+place. On 2026-11-11 that left six CAS names on forth hard-linked to another file's bytes
+(`nlink` 2, wrong sha512), i.e. silent wrong content for later installs, not just a race.
 
 Every ARC scale set mounts the node's `/var/cache/ci` hostPath into its runner
 pods and points pnpm at it (`npm_config_store_dir=/var/cache/ci/pnpm-store`),

@@ -3078,11 +3078,108 @@ def test_r6_cache_pnpm_off_the_pool_passes(tmp_path, runs_on):
     assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
 
 
-@pytest.mark.parametrize("with_block", ["", "cache: npm", "cache: yarn", "cache: ''"])
+@pytest.mark.parametrize("with_block", ["", "cache: yarn", "cache: ''"])
 def test_r6_pool_job_without_a_pnpm_cache_passes(tmp_path, with_block):
     p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", with_block=with_block))
     pnpm_package_json(tmp_path)
     assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_cache_npm_on_the_pool_is_reported(tmp_path):
+    """`cache: npm` asks `npm config get cache`, which is /var/cache/ci/npm on the pool."""
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", with_block="cache: npm"))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "shares one npm cache" in found[0].message
+    assert "/var/cache/ci/npm" in found[0].fix
+
+
+def test_r6_cache_npm_off_the_pool_passes(tmp_path):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-latest", with_block="cache: npm"))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def hand_cache_job(runs_on: str, path: str, pre: str = "") -> str:
+    """A one-job workflow with an `actions/cache` step caching `path` (after `pre`, raw step YAML)."""
+    path_lines = "".join(f"            {line}\n" for line in path.splitlines())
+    return (
+        "name: CI\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  test:\n"
+        f"    runs-on: {runs_on}\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        f"{pre}"
+        "      - uses: actions/cache@v4\n"
+        "        with:\n"
+        "          path: |\n"
+        f"{path_lines}"
+        "          key: store-${{ hashFiles('pnpm-lock.yaml') }}\n"
+        "      - run: pnpm install --frozen-lockfile\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/var/cache/ci/pnpm-store",
+        "/var/cache/ci/npm",
+        "/var/cache/ci",
+        "${{ env.npm_config_store_dir }}",
+    ],
+)
+def test_r6_actions_cache_of_a_store_path_on_the_pool_is_reported(tmp_path, path):
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", path))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "`actions/cache` step" in found[0].message
+    assert "Delete this `actions/cache` step" in found[0].fix
+
+
+def test_r6_actions_cache_of_the_pnpm_store_path_output_is_reported(tmp_path):
+    pre = (
+        "      - id: store\n"
+        '        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"\n'
+    )
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", "${{ steps.store.outputs.path }}", pre))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "pnpm store path" in found[0].message
+
+
+def test_r6_actions_cache_of_an_env_var_set_from_pnpm_store_path_is_reported(tmp_path):
+    pre = '      - run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"\n'
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", "${{ env.STORE_PATH }}", pre))
+    assert len(only(run([p]), RULE_PNPM_STORE_CACHE)) == 1
+
+
+@pytest.mark.parametrize("uses", ["actions/cache/restore@v4", "actions/cache/save@v4"])
+def test_r6_actions_cache_restore_and_save_forms_are_reported(tmp_path, uses):
+    body = hand_cache_job("ubuntu-devino", "/var/cache/ci/pnpm-store").replace("actions/cache@v4", uses)
+    assert len(only(run([wf(tmp_path, "ci.yml", body)]), RULE_PNPM_STORE_CACHE)) == 1
+
+
+def test_r6_actions_cache_of_a_store_path_on_a_hosted_runner_passes(tmp_path):
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-latest", "/var/cache/ci/pnpm-store"))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["node_modules", "~/.cache/ms-playwright", "dist\\n.next/cache", ".pnpm-store", "~/.local/share/pnpm/store"],
+)
+def test_r6_actions_cache_of_an_unrelated_path_on_the_pool_passes(tmp_path, path):
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", path))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_actions_cache_store_path_honours_the_allow_marker(tmp_path):
+    body = hand_cache_job("ubuntu-devino", "/var/cache/ci/pnpm-store").replace(
+        "  test:\n", "  test:\n    # ci-lint: allow-pnpm-cache per-pod emptyDir store on this set\n"
+    )
+    assert only(run([wf(tmp_path, "ci.yml", body)]), RULE_PNPM_STORE_CACHE) == []
 
 
 def test_r6_only_the_pool_job_is_reported_when_a_file_mixes_runners(tmp_path):
