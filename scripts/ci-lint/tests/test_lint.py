@@ -23,6 +23,7 @@ from lint import (
     RULE_CONCURRENCY,
     RULE_DOCKER_BUILD,
     RULE_NIGHTLY_RUNNER,
+    RULE_PNPM_STORE_CACHE,
     RULE_UNPARSEABLE,
     lint_files,
     resolve_baseline,
@@ -2996,3 +2997,292 @@ def test_reusable_workflow_passes_the_base_to_the_linter():
     """Without `--base` the linter ignores `.github/ci-lint-baseline` and lints whole files."""
     text = (CI_LINT_DIR.parents[1] / ".github" / "workflows" / "ci-lint.yml").read_text(encoding="utf-8")
     assert '--base "$BASE_SHA"' in text
+
+
+# -- R6: pnpm-store-cache --------------------------------------------------
+#
+# Every ARC runner pod on a node shares one pnpm store through the
+# `/var/cache/ci` hostPath. `actions/setup-node` with `cache: pnpm` extracts a
+# ~2 GB tarball over that store while sibling pods install out of it, and the
+# siblings die with ERR_PNPM_ENOENT copyfile (Shorty dev, 2026-11-10). Hosted
+# runners have a private store per job, so the same step is correct there.
+
+
+def pnpm_job(runs_on: str, setup: str = "actions/setup-node@v4", with_block: str = "cache: pnpm") -> str:
+    """A one-job workflow whose setup-node step carries `with_block` (indented under `with:`)."""
+    with_lines = "".join(f"          {line}\n" for line in with_block.splitlines()) if with_block else ""
+    return (
+        "name: CI\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  test:\n"
+        f"    runs-on: {runs_on}\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - uses: pnpm/action-setup@v4\n"
+        f"      - uses: {setup}\n"
+        "        with:\n"
+        "          node-version: 22\n"
+        f"{with_lines}"
+        "      - run: pnpm install --frozen-lockfile\n"
+    )
+
+
+def pnpm_package_json(root: Path, manager: str = "pnpm@10.18.0") -> None:
+    (root / "package.json").write_text('{"name": "x", "packageManager": "%s"}\n' % manager, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "runs_on",
+    [
+        "ubuntu-devino",
+        "ubuntu-devino-nightly",
+        "[self-hosted, ubuntu-devino]",
+        "{ group: arc, labels: ubuntu-devino }",
+        "{ group: arc, labels: [ubuntu-devino-nightly] }",
+        "${{ github.event_name == 'schedule' && 'ubuntu-devino-nightly' || 'ubuntu-devino' }}",
+    ],
+)
+def test_r6_cache_pnpm_on_the_pool_is_reported_in_every_runs_on_form(tmp_path, runs_on):
+    p = wf(tmp_path, "ci.yml", pnpm_job(runs_on))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    text = p.read_text(encoding="utf-8").splitlines()
+    assert text[found[0].line - 1].strip() == "cache: pnpm"
+    assert "ERR_PNPM_ENOENT" in found[0].message
+    assert "Delete `cache: pnpm`" in found[0].fix
+
+
+@pytest.mark.parametrize("spelling", ["pnpm", "'pnpm'", '"pnpm"', "PNPM"])
+def test_r6_every_spelling_of_the_cache_value_is_reported(tmp_path, spelling):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", with_block=f"cache: {spelling}"))
+    assert len(only(run([p]), RULE_PNPM_STORE_CACHE)) == 1
+
+
+@pytest.mark.parametrize(
+    "runs_on",
+    [
+        "ubuntu-latest",
+        "ubuntu-24.04",
+        "[ubuntu-latest]",
+        "{ labels: ubuntu-latest }",
+        "macos-latest",
+        # an expression this lint cannot resolve is not guessed at
+        "${{ matrix.os }}",
+    ],
+)
+def test_r6_cache_pnpm_off_the_pool_passes(tmp_path, runs_on):
+    """caramel, upup, sendly-js, statify-sdk and dokploy-community use it on hosted runners."""
+    p = wf(tmp_path, "ci.yml", pnpm_job(runs_on))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+@pytest.mark.parametrize("with_block", ["", "cache: npm", "cache: yarn", "cache: ''"])
+def test_r6_pool_job_without_a_pnpm_cache_passes(tmp_path, with_block):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", with_block=with_block))
+    pnpm_package_json(tmp_path)
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_only_the_pool_job_is_reported_when_a_file_mixes_runners(tmp_path):
+    p = wf(
+        tmp_path,
+        "ci.yml",
+        """
+        name: CI
+        on:
+          pull_request:
+        jobs:
+          hosted:
+            runs-on: ubuntu-latest
+            steps:
+              - uses: actions/setup-node@v4
+                with:
+                  cache: pnpm
+          pool:
+            runs-on: ubuntu-devino
+            steps:
+              - uses: actions/setup-node@v4
+                with:
+                  # cache: pnpm  (a comment is not an input)
+                  node-version: 22
+              - uses: actions/setup-node@v4
+                with:
+                  cache: pnpm
+                  cache-dependency-path: pnpm-lock.yaml
+        """,
+    )
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "`pool`" in found[0].message
+    assert found[0].line == 20
+
+
+def test_r6_a_cache_expression_with_a_pnpm_branch_is_reported(tmp_path):
+    p = wf(
+        tmp_path,
+        "ci.yml",
+        pnpm_job("ubuntu-devino", with_block="cache: ${{ github.event_name == 'push' && 'pnpm' || '' }}"),
+    )
+    assert len(only(run([p]), RULE_PNPM_STORE_CACHE)) == 1
+
+
+def test_r6_reusable_workflow_defaulting_to_the_pool_is_reported(tmp_path):
+    p = wf(
+        tmp_path,
+        "lane.yml",
+        """
+        name: lane
+        on:
+          workflow_call:
+            inputs:
+              runner:
+                type: string
+                default: ubuntu-devino
+        jobs:
+          gate:
+            runs-on: ${{ inputs.runner }}
+            steps:
+              - uses: actions/setup-node@v4
+                with:
+                  cache: pnpm
+        """,
+    )
+    assert len(only(run([p]), RULE_PNPM_STORE_CACHE)) == 1
+
+
+def test_r6_reusable_workflow_defaulting_to_hosted_passes(tmp_path):
+    p = wf(
+        tmp_path,
+        "lane.yml",
+        """
+        name: lane
+        on:
+          workflow_call:
+            inputs:
+              runner:
+                type: string
+                default: ubuntu-latest
+        jobs:
+          gate:
+            runs-on: ${{ inputs.runner }}
+            steps:
+              - uses: actions/setup-node@v4
+                with:
+                  cache: pnpm
+        """,
+    )
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+# setup-node v5 auto-caches whatever package.json's `packageManager` names
+# (npm, yarn or pnpm) unless `package-manager-cache: false`. v6.0.0 narrowed it
+# to npm only (actions/setup-node#1374), and v7 kept that. v4 had no auto-cache.
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "actions/setup-node@v5",
+        "actions/setup-node@v5.0.0",
+        "actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0",
+    ],
+)
+def test_r6_setup_node_v5_auto_caching_pnpm_is_reported(tmp_path, setup):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", setup=setup, with_block=""))
+    pnpm_package_json(tmp_path)
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "setup-node v5" in found[0].message
+    assert "package-manager-cache: false" in found[0].fix
+    assert "actions/setup-node@" in p.read_text(encoding="utf-8").splitlines()[found[0].line - 1]
+
+
+@pytest.mark.parametrize(
+    "setup, with_block, manager",
+    [
+        # explicitly off, in both spellings setup-node accepts
+        ("actions/setup-node@v5", "package-manager-cache: false", "pnpm@10.18.0"),
+        ("actions/setup-node@v5", "package-manager-cache: 'false'", "pnpm@10.18.0"),
+        # v6+ auto-caches npm only; v4 has no auto-cache at all
+        ("actions/setup-node@v6", "", "pnpm@10.18.0"),
+        ("actions/setup-node@v7.1.0", "", "pnpm@10.18.0"),
+        ("actions/setup-node@v4", "", "pnpm@10.18.0"),
+        # v5 auto-caching npm or yarn is not this rule's business
+        ("actions/setup-node@v5", "", "npm@11.4.0"),
+        ("actions/setup-node@v5", "", "yarn@4.9.0"),
+        # a sha pin with no version comment is not guessed at
+        ("actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444", "", "pnpm@10.18.0"),
+    ],
+)
+def test_r6_setup_node_without_pnpm_auto_caching_passes(tmp_path, setup, with_block, manager):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", setup=setup, with_block=with_block))
+    pnpm_package_json(tmp_path, manager)
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_setup_node_v5_with_no_package_json_passes(tmp_path):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", setup="actions/setup-node@v5", with_block=""))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_setup_node_v5_auto_caching_on_a_hosted_runner_passes(tmp_path):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-latest", setup="actions/setup-node@v5", with_block=""))
+    pnpm_package_json(tmp_path)
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_allow_pnpm_cache_on_the_job_exempts_it(tmp_path):
+    body = pnpm_job("ubuntu-devino").replace(
+        "  test:\n", "  test:\n    # ci-lint: allow-pnpm-cache this scale set has a per-pod emptyDir store\n"
+    )
+    p = wf(tmp_path, "ci.yml", body)
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_allow_pnpm_cache_in_the_header_covers_every_job(tmp_path):
+    body = "# ci-lint: allow-pnpm-cache per-pod store on this pool\n" + pnpm_job("ubuntu-devino")
+    p = wf(tmp_path, "ci.yml", body)
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_allow_pnpm_cache_without_a_reason_is_not_an_exemption(tmp_path):
+    body = pnpm_job("ubuntu-devino").replace("  test:\n", "  test:\n    # ci-lint: allow-pnpm-cache\n")
+    p = wf(tmp_path, "ci.yml", body)
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "no reason" in found[0].message
+
+
+def test_r6_fix_prints_a_marker_the_linter_reads(tmp_path):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino"))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    marker_line = next(line for line in found[0].fix.splitlines() if lint.ALLOW_PNPM_CACHE_MARKER in line)
+    assert lint._ALLOW_PNPM_CACHE_RE.search(marker_line) is not None
+
+
+def test_r6_baseline_reports_a_newly_added_cache_line_and_not_an_old_one(tmp_path):
+    repo = init_repo(tmp_path)
+    rel = ".github/workflows/ci.yml"
+    old = pnpm_job("ubuntu-devino")
+    wf(repo, "ci.yml", old)
+    base = commit(repo, "base")
+    # untouched: the existing finding is filtered out
+    added = lint_files([rel], added_lines_only=True, baseline_sha=base, base_ref=base, repo_root=repo)
+    assert only(added, RULE_PNPM_STORE_CACHE) == []
+    # a second pool job adding `cache: pnpm` is reported, and only that one
+    new = old + (
+        "  e2e:\n"
+        "    runs-on: ubuntu-devino\n"
+        "    steps:\n"
+        "      - uses: actions/setup-node@v4\n"
+        "        with:\n"
+        "          cache: pnpm\n"
+    )
+    wf(repo, "ci.yml", new)
+    commit(repo, "add e2e")
+    added = lint_files([rel], added_lines_only=True, baseline_sha=base, base_ref=base, repo_root=repo)
+    found = only(added, RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "`e2e`" in found[0].message

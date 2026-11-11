@@ -15,6 +15,10 @@ ruleset, so that the savings W1-W4 land are not undone by the next PR.
     R4  caller-permissions    a job calling a reusable workflow without holding
                               the permissions that workflow declares, which
                               fails the run at startup with nothing to read
+    R6  pnpm-store-cache      a self-hosted job whose `actions/setup-node`
+                              restores the pnpm cache (`cache: pnpm`, or v5's
+                              automatic pnpm caching) over the store every pod
+                              on the node shares, racing concurrent installs
 
 WHY LINE NUMBERS, NOT JUST FILES. Adoption is incremental: a repo drops a
 `.github/ci-lint-baseline` file naming the sha at which it was migrated, and
@@ -40,6 +44,7 @@ See scripts/ci-lint/README.md.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -839,6 +844,201 @@ def _bun_engine_findings(
     return findings
 
 
+# ── pnpm store cache ───────────────────────────────────────────────────────
+#
+# Every ARC scale set mounts the node's hostPath `/var/cache/ci` into its runner
+# pods and points pnpm at it (`npm_config_store_dir=/var/cache/ci/pnpm-store`).
+# So every concurrent job on a node shares ONE pnpm store, and it is already warm.
+#
+# `actions/setup-node` with `cache: pnpm` asks `pnpm store path`, gets that shared
+# directory, and on a hit extracts a ~2 GB tarball over it while sibling pods are
+# hard-linking out of the same files. A concurrent `pnpm install` then dies with
+#
+#   ERR_PNPM_ENOENT  ENOENT: no such file or directory, copyfile
+#   '/var/cache/ci/pnpm-store/v10/files/...'
+#
+# Diagnosed 2026-11-10 on Shorty `dev` (fixed in Shorty #1173). Nothing else in
+# the cluster writes to the store; the only writer that races is this restore.
+# On the pool the cache buys nothing — the store it restores into is already
+# there — so the fix is to drop it, not to tune it.
+#
+# GitHub-hosted runners have a private, empty store per job, so `cache: pnpm` is
+# correct there and is not flagged.
+#
+# The implicit form. setup-node v5 turned caching ON by default
+# (`package-manager-cache`, default true) for whichever of npm/yarn/pnpm the root
+# package.json's `packageManager` names. v6.0.0 narrowed that to npm only
+# (actions/setup-node#1374, "Limit automatic caching to npm"), and v7 keeps the
+# npm-only rule. So a v5 step with no `cache:` input still restores the pnpm
+# store when `packageManager` is `pnpm@...`; v4 and below, and v6 and above, do not.
+
+RULE_PNPM_STORE_CACHE = "pnpm-store-cache"
+ALLOW_PNPM_CACHE_MARKER = "allow-pnpm-cache"
+WRITTEN_PNPM_CACHE_MARKER = f"ci-lint: {ALLOW_PNPM_CACHE_MARKER}"
+_ALLOW_PNPM_CACHE_RE = _marker_re(ALLOW_PNPM_CACHE_MARKER)
+
+_SETUP_NODE_REF_RE = re.compile(r"^actions/setup-node@(?P<ref>\S+)$")
+_MAJOR_RE = re.compile(r"^v?(?P<major>\d+)(?:\.\d+)*$")
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+# A sha-pinned `uses:` carries its version as a trailing comment, which YAML drops,
+# so it is read from the raw line: `uses: actions/setup-node@<sha> # v5.0.0`.
+_PIN_COMMENT_RE = re.compile(r"#\s*v?(?P<major>\d+)(?:\.\d+)*\b")
+# setup-node v5's own reading of `packageManager`: `^(?:\^)?(npm|yarn|pnpm)@`.
+_PNPM_PACKAGE_MANAGER_RE = re.compile(r"^\^?pnpm@")
+# The setup-node majors whose automatic caching covers pnpm: v5 only.
+_AUTO_CACHE_PNPM_MAJORS = frozenset({5})
+
+
+def _setup_node_major(uses: str, raw_line: str) -> int | None:
+    """setup-node's major version, from the ref or a sha pin's comment; None if unknown."""
+    match = _SETUP_NODE_REF_RE.match(uses.strip())
+    if match is None:
+        return None
+    ref = match.group("ref")
+    version = _MAJOR_RE.match(ref)
+    if version is not None:
+        return int(version.group("major"))
+    if _FULL_SHA_RE.match(ref):
+        comment = raw_line.find("#")
+        pinned = _PIN_COMMENT_RE.match(raw_line[comment:]) if comment >= 0 else None
+        if pinned is not None:
+            return int(pinned.group("major"))
+    return None
+
+
+def _cache_names_pnpm(value) -> bool:
+    """True when a `cache:` input is pnpm, literally or on a branch of the one resolvable ternary."""
+    if not isinstance(value, str):
+        return False
+    if is_expression(value):
+        return any(label.strip().lower() == "pnpm" for label in _expression_labels(value))
+    return value.strip().lower() == "pnpm"
+
+
+def _auto_cache_enabled(value) -> bool:
+    """setup-node reads `(input || 'true').toUpperCase() === 'TRUE'`; an expression is unknown."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip()
+    if is_expression(text):
+        return False
+    return text.upper() in ("", "TRUE")
+
+
+def _root_package_manager(repo_root: Path | None) -> str | None:
+    """The root package.json's `packageManager`, which is all setup-node v5 reads."""
+    if repo_root is None:
+        return None
+    try:
+        data = json.loads((Path(repo_root) / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = data.get("packageManager") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+_PNPM_CACHE_EXEMPTION_HINT = (
+    "If this job really needs its own restore — a runner whose store is NOT the shared "
+    "hostPath — say so on the job or in the workflow header:  "
+    f"# {WRITTEN_PNPM_CACHE_MARKER} <reason>"
+)
+
+
+def _pnpm_cache_findings(
+    path: str,
+    lines: list[str],
+    doc: dict,
+    repo_root: Path | None = None,
+    caller_values: dict | None = None,
+) -> list[Finding]:
+    jobs = _jobs(doc)
+    if not jobs:
+        return []
+    header_span, job_spans = _marker_spans(lines, doc, jobs)
+    package_manager: str | None = None
+    package_manager_read = False
+    findings: list[Finding] = []
+    for index, (name, job, job_start, _job_end) in enumerate(jobs):
+        if not _pool_capable(job.get("runs-on"), doc, caller_values):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            uses = step.get("uses")
+            if not isinstance(uses, str) or not _SETUP_NODE_RE.match(uses.strip()):
+                continue
+            inputs = step.get("with") if isinstance(step.get("with"), dict) else {}
+            step_line = step.get(_NODE_START)
+            uses_line = _key_line(step, "uses") or step_line
+            cache = inputs.get("cache")
+            if _cache_names_pnpm(cache):
+                line = _key_line(inputs, "cache") or uses_line
+                cause = f"sets `cache: {cache}`"
+                fix = (
+                    "Delete `cache: pnpm` (and its `cache-dependency-path:`) from this step. The "
+                    "pool's pnpm store is already warm at `/var/cache/ci/pnpm-store`; "
+                    "`pnpm install --frozen-lockfile` reads it directly."
+                )
+            elif not (isinstance(cache, str) and cache.strip()):
+                raw = lines[uses_line - 1] if uses_line and uses_line <= len(lines) else ""
+                major = _setup_node_major(uses, raw)
+                if major not in _AUTO_CACHE_PNPM_MAJORS:
+                    continue
+                if not _auto_cache_enabled(inputs.get("package-manager-cache")):
+                    continue
+                if not package_manager_read:
+                    package_manager = _root_package_manager(repo_root or _infer_repo_root(path))
+                    package_manager_read = True
+                if package_manager is None or not _PNPM_PACKAGE_MANAGER_RE.match(package_manager.strip()):
+                    continue
+                line = uses_line
+                cause = (
+                    f"uses setup-node v{major} with no `cache:` and `package-manager-cache` left "
+                    f"on, and package.json says `packageManager: {package_manager}` — v5 "
+                    "auto-caches pnpm in that case (v6 narrowed auto-caching to npm)"
+                )
+                fix = (
+                    "Add `package-manager-cache: false` under this step's `with:`, or move to "
+                    "`actions/setup-node@v6` or later, which only auto-caches npm."
+                )
+            else:
+                continue
+            exemption = _marker_state(lines, [header_span, job_spans[index]], _ALLOW_PNPM_CACHE_RE)
+            if exemption == "allowed":
+                continue
+            message = (
+                f"Job `{name}` runs on the self-hosted pool and its `actions/setup-node` step "
+                f"{cause}. Every runner pod on a node shares one pnpm store through the "
+                "`/var/cache/ci` hostPath, so restoring the ~2 GB cache tarball over it races the "
+                "installs of concurrent jobs and fails them with "
+                "`ERR_PNPM_ENOENT ... copyfile /var/cache/ci/pnpm-store/v10/files/...`. The store "
+                "is already warm, so the restore buys nothing on this pool."
+            )
+            if exemption == "no-reason":
+                message = (
+                    f"Job `{name}` is marked with `# {WRITTEN_PNPM_CACHE_MARKER}` but no reason "
+                    "follows it, so the exemption does not apply. The reason is the whole point "
+                    f"of the marker: it is what a reviewer reads. {message}"
+                )
+            anchor = _key_line(job, "runs-on") or job_start
+            findings.append(
+                Finding(
+                    file=path,
+                    line=line,
+                    rule=RULE_PNPM_STORE_CACHE,
+                    message=message,
+                    fix=f"{fix}\n\n{_PNPM_CACHE_EXEMPTION_HINT}",
+                    anchors=tuple(sorted({line, uses_line, job_start, anchor})),
+                )
+            )
+    return findings
+
+
 def _render(value) -> str:
     if isinstance(value, list):
         return ", ".join(str(item) for item in value)
@@ -1332,6 +1532,9 @@ def lint_text(
         path, lines, doc, Path(repo_root) if repo_root is not None else None
     )
     findings += _bun_engine_findings(path, lines, doc, caller_values)
+    findings += _pnpm_cache_findings(
+        path, lines, doc, Path(repo_root) if repo_root is not None else None, caller_values
+    )
     return findings
 
 

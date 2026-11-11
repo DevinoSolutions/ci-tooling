@@ -347,6 +347,68 @@ and the three bun-capable org reusables (`ai-evals`, `lighthouse-gate`,
 `actions/setup-node` before any bun step, which is what makes every caller of
 the shared lane immune.
 
+### `pnpm-store-cache`
+
+A job on the self-hosted pool whose `actions/setup-node` step restores the
+pnpm cache is reported. Two shapes count:
+
+- **`cache: pnpm`**, in any spelling, or as a branch of the one
+  `${{ A && 'x' || 'y' }}` ternary the linter resolves; and
+- **setup-node v5's automatic pnpm cache**: a `@v5`/`@v5.x.y` step (or a sha
+  pin whose comment says `# v5…`) with no `cache:` input,
+  `package-manager-cache` left at its default, and a root `package.json` whose
+  `packageManager` is `pnpm@…`.
+
+Every ARC scale set mounts the node's `/var/cache/ci` hostPath into its runner
+pods and points pnpm at it (`npm_config_store_dir=/var/cache/ci/pnpm-store`),
+so every concurrent job on a node shares one pnpm store, and it is already
+warm. `cache: pnpm` asks `pnpm store path`, gets that shared directory, and on a
+hit extracts a ~2 GB tarball over it while sibling pods are linking out of the
+same files. The siblings fail with
+
+```
+ERR_PNPM_ENOENT  ENOENT: no such file or directory, copyfile '/var/cache/ci/pnpm-store/v10/files/...'
+```
+
+That is what reddened Shorty's `dev` on 2026-11-10, fixed by Shorty #1173.
+Nothing else in the cluster writes to the store; the restore is the only racer.
+On the pool the cache buys nothing, so the fix is to drop it:
+
+```yaml
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # no `cache: pnpm`, no `cache-dependency-path:` — the store is on the node
+```
+
+**Why v5 and only v5 for the implicit form.** Read from the action's source,
+not its docs:
+
+| setup-node | automatic caching (no `cache:` input) |
+|---|---|
+| v4 and below | none — `package-manager-cache` does not exist |
+| v5.x | on by default for whichever of `npm`/`yarn`/`pnpm` the root `packageManager` names (`^(?:\^)?(npm\|yarn\|pnpm)@`) |
+| v6.0.0+ | npm only — "Limit automatic caching to npm", actions/setup-node#1374; v7 unchanged |
+
+So a v5 step on a pnpm repository restores the shared store without ever
+saying `pnpm`. Fix it with `package-manager-cache: false` or by moving to v6+.
+The root `package.json` is read from the checkout being linted; when it cannot
+be read the implicit form is not reported.
+
+Scope, deliberately narrow:
+
+- **only the self-hosted pool** (`ubuntu-devino*`, in string, list, `labels:`
+  and the event-conditional ternary forms, plus a reusable workflow's
+  `${{ inputs.<name> }}` resolved the same way `bun-engine-order` resolves
+  it). GitHub-hosted runners get a private, empty store per job, where
+  `cache: pnpm` is the right thing — caramel, upup, sendly-js, statify-sdk and
+  dokploy-community use it there and are not flagged.
+- **an unresolvable `runs-on:` or `cache:` expression is not reported**, and
+  neither is a sha pin with no version comment.
+
+Exempt with `# ci-lint: allow-pnpm-cache <reason>` on the job or in the
+workflow header — a scale set whose store is NOT the shared hostPath, say.
+
 ### `unparseable-workflow`
 
 A file that is not valid YAML is reported as a finding rather than crashing
@@ -354,7 +416,7 @@ the run, pointing at the line PyYAML choked on.
 
 ## The escape-hatch comments
 
-All five rules have one. They take the same shape — `# ci-lint: <marker> <reason>`
+All six rules have one. They take the same shape — `# ci-lint: <marker> <reason>`
 — and in all four the reason is required, because the reason is what a reviewer
 reads and a bare marker is just a mute button.
 
@@ -365,6 +427,7 @@ reads and a bare marker is just a mute button.
 | `allow-permissions` | `caller-permissions` | the job it sits in, or every job when it sits in the workflow header |
 | `allow-missing-concurrency` | `missing-concurrency` | the workflow header only — the rule is workflow-scoped |
 | `allow-bun-engine` | `bun-engine-order` | the job it sits in, or every job when it sits in the workflow header |
+| `allow-pnpm-cache` | `pnpm-store-cache` | the job it sits in, or every job when it sits in the workflow header |
 
 `allow-schedule-main`, `allow-permissions`, `allow-missing-concurrency` and
 `allow-bun-engine` are covered under their rules above.
