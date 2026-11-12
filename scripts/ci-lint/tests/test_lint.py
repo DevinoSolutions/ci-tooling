@@ -3677,7 +3677,6 @@ def test_r6_the_variable_assigned_on_the_same_line_as_the_store_path_is_the_stor
     [
         "pnpm config set store-dir $GITHUB_WORKSPACE/.pnpm-store",
         "pnpm config set store-dir ${{ github.workspace }}/.pnpm-store",
-        "npm config set cache $GITHUB_WORKSPACE/.npm",
         'echo "npm_config_store_dir=$GITHUB_WORKSPACE/.pnpm-store" >> "$GITHUB_ENV"',
     ],
 )
@@ -3918,3 +3917,178 @@ def test_r6_a_job_env_store_path_handed_to_a_step_output_is_followed(tmp_path):
     """
     body = steps_job("ubuntu-devino", steps, job_extra="    env:\n      STORE: /var/cache/ci/pnpm-store\n")
     assert len(r6(tmp_path, body)) == 1
+
+
+# -- R6, third round: depth, relocation per tool, a PR that edits only a composite action -----
+
+
+def _chain(tmp_path, levels: int, leaf: str) -> None:
+    """action `c1` calls `c2` ... calls `c<levels>`, whose steps are `leaf`."""
+    for level in range(1, levels):
+        write_action(
+            tmp_path,
+            f"c{level}",
+            f"runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/c{level + 1}\n",
+        )
+    write_action(tmp_path, f"c{levels}", leaf)
+
+
+LEAF_CACHE_PNPM = """
+    runs:
+      using: composite
+      steps:
+        - uses: actions/setup-node@v4
+          with:
+            cache: pnpm
+"""
+
+
+def test_r6_a_cache_step_exactly_three_composite_levels_deep_is_reported(tmp_path):
+    _chain(tmp_path, 3, LEAF_CACHE_PNPM)
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/c1\n"))) == 1
+
+
+def test_r6_a_cache_step_four_composite_levels_deep_is_beyond_the_limit(tmp_path):
+    """Documented limit: three levels are followed, a fourth is not."""
+    _chain(tmp_path, 4, LEAF_CACHE_PNPM)
+    assert r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/c1\n")) == []
+
+
+def _shell(tmp_path, command: str, query: str, cache_path: str):
+    pre = f"      - run: {command}\n      - id: s\n        run: echo \"dir=$({query})\" >> \"$GITHUB_OUTPUT\"\n"
+    return r6(tmp_path, hand_cache_job("ubuntu-devino", cache_path, pre))
+
+
+def test_r6_moving_npm_does_not_move_pnpm(tmp_path):
+    found = _shell(tmp_path, "npm config set cache $GITHUB_WORKSPACE/.npm", "pnpm store path", "${{ steps.s.outputs.dir }}")
+    assert len(found) == 1
+
+
+def test_r6_moving_pnpm_does_not_move_npm(tmp_path):
+    found = _shell(tmp_path, "pnpm config set store-dir $GITHUB_WORKSPACE/.pnpm-store", "npm config get cache", "${{ steps.s.outputs.dir }}")
+    assert len(found) == 1
+
+
+def test_r6_moving_npm_moves_the_npm_query(tmp_path):
+    assert _shell(tmp_path, "npm config set cache $GITHUB_WORKSPACE/.npm", "npm config get cache", "${{ steps.s.outputs.dir }}") == []
+
+
+@pytest.mark.parametrize(
+    "scope_name, query, expect",
+    [
+        ("npm_config_cache", "pnpm store path", 1),
+        ("npm_config_store_dir", "npm config get cache", 1),
+        ("npm_config_cache", "npm config get cache", 0),
+        ("npm_config_store_dir", "pnpm store path", 0),
+    ],
+)
+def test_r6_a_job_env_override_moves_only_its_own_tool(tmp_path, scope_name, query, expect):
+    body = hand_cache_job(
+        "ubuntu-devino",
+        "${{ steps.s.outputs.dir }}",
+        f"      - id: s\n        run: echo \"dir=$({query})\" >> \"$GITHUB_OUTPUT\"\n",
+    ).replace("    steps:\n", f"    env:\n      {scope_name}: ${{{{ github.workspace }}}}/local\n    steps:\n", 1)
+    assert len(r6(tmp_path, body)) == expect
+
+
+def test_r6_a_one_command_env_prefix_does_not_relocate_later_queries(tmp_path):
+    """`VAR=x cmd` applies to that command alone; the query two steps later still reads the shared store."""
+    found = _shell(
+        tmp_path,
+        "npm_config_store_dir=$GITHUB_WORKSPACE/.pnpm-store pnpm install --frozen-lockfile",
+        "pnpm store path",
+        "${{ steps.s.outputs.dir }}",
+    )
+    assert len(found) == 1
+
+
+def test_r6_a_one_command_env_prefix_on_the_query_itself_is_not_the_shared_store(tmp_path):
+    pre = '      - id: s\n        run: dir=$(npm_config_store_dir=$GITHUB_WORKSPACE/.s pnpm store path) && echo "dir=$dir" >> "$GITHUB_OUTPUT"\n'
+    assert r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre)) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'export npm_config_store_dir=$GITHUB_WORKSPACE/.s',
+        'echo "npm_config_store_dir=$GITHUB_WORKSPACE/.s" >> "$GITHUB_ENV"',
+        "export npm_config_store_dir=$GITHUB_WORKSPACE/.s && true",
+    ],
+)
+def test_r6_exported_or_persisted_env_assignments_still_relocate(tmp_path, command):
+    assert _shell(tmp_path, command, "pnpm store path", "${{ steps.s.outputs.dir }}") == []
+
+
+# A PR that edits only the composite action.
+
+
+POOL_CALLER = "- uses: ./.github/actions/setup\n"
+
+
+def test_r6_editing_only_a_composite_to_add_cache_pnpm_is_reported_when_a_pool_job_calls_it(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", POOL_CALLER))
+    action = tmp_path / ".github" / "actions" / "setup" / "action.yml"
+    found = only(run([action]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert action.read_text(encoding="utf-8").splitlines()[found[0].line - 1].strip() == "cache: pnpm"
+    assert "`test`" in found[0].message and "ci.yml" in found[0].message
+
+
+def test_r6_editing_only_a_composite_to_add_pnpm_action_setup_cache_is_reported(tmp_path):
+    write_action(
+        tmp_path,
+        "setup",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: pnpm/action-setup@v4
+              with:
+                cache: true
+        """,
+    )
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", POOL_CALLER))
+    action = tmp_path / ".github" / "actions" / "setup" / "action.yml"
+    found = only(run([action]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert action.read_text(encoding="utf-8").splitlines()[found[0].line - 1].strip() == "cache: true"
+
+
+def test_r6_editing_only_a_composite_called_only_from_hosted_jobs_passes(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-latest", POOL_CALLER))
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_editing_only_a_composite_nobody_calls_passes(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", "- run: echo hi\n"))
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_editing_only_an_inner_composite_is_reported_through_the_outer_one(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    write_action(tmp_path, "outer", "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/setup\n")
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", "- uses: ./.github/actions/outer\n"))
+    action = tmp_path / ".github" / "actions" / "setup" / "action.yml"
+    assert len(only(run([action]), RULE_PNPM_STORE_CACHE)) == 1
+    assert only(run([tmp_path / ".github" / "actions" / "outer" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_a_pool_job_exempted_with_the_marker_does_not_make_the_composite_a_finding(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    body = steps_job("ubuntu-devino", POOL_CALLER).replace(
+        "  test:\n", "  test:\n    # ci-lint: allow-pnpm-cache per-pod emptyDir store on this set\n"
+    )
+    wf(tmp_path, "ci.yml", body)
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_a_one_command_prefix_inside_a_substitution_does_not_relocate_a_later_query(tmp_path):
+    pre = (
+        "      - run: probe=$(npm_config_store_dir=$GITHUB_WORKSPACE/.s pnpm store path)\n"
+        "      - id: s\n"
+        '        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"\n'
+    )
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre))) == 1

@@ -378,10 +378,13 @@ already warm. Seven shapes count:
   passes or the input's default (up to three levels deep). The finding is anchored on the caller's
   `uses:` line and names the action file and line.
 
-A composite `action.yml` that a PR touches is also linted on its own, but only for what is wrong on
-any runner: an `actions/cache` step with a literal `/var/cache/ci` path, or a `cache:` forwarded from
-`${{ inputs.x }}` whose default is `pnpm` or `npm`. A literal `cache: pnpm` inside a composite is left
-to the pool job that calls it, because hosted callers may use the same action correctly.
+A composite `action.yml` that a PR touches is also linted on its own. Wrong on any runner, so always
+reported: an `actions/cache` step with a literal `/var/cache/ci` path, or a `cache:` forwarded from
+`${{ inputs.x }}` whose default is `pnpm` or `npm`. A literal `cache: pnpm` (or `pnpm/action-setup`
+`cache: true`) is wrong only when a pool job calls the action, because hosted callers may use the same
+action correctly. So the repo's own `.github/workflows/*.y*ml` are searched, through nested composites
+too, and the finding lands on the action's own line when a pool-capable job (not exempted by
+`# ci-lint: allow-pnpm-cache`) reaches it. A PR that edits only the `action.yml` is therefore caught.
 
 What does not count, because it is not the shared store: a workspace-local `.pnpm-store`, a path
 under `~`, a store env var pointed at `${{ github.workspace }}/…` or `$GITHUB_WORKSPACE/…`, a
@@ -440,7 +443,24 @@ Scope, deliberately narrow:
   dokploy-community use it there and are not flagged.
 - **an unresolvable `runs-on:` or `cache:` expression is not reported**, and
   neither is a sha pin with no version comment.
-- a composite action in another repository (`owner/repo/path@ref`) is not followed.
+
+**Known limits** (what R6 cannot see):
+
+- **`runs-on:` shapes it cannot resolve are skipped, not guessed at:** `${{ vars.X || 'ubuntu-devino' }}`,
+  `${{ matrix.os }}`, `fromJSON(...)`, and `${{ inputs.runner }}` on a reusable workflow whose default is
+  hosted and whose callers pass the pool. A sweep found 91 pool jobs in 34 repos whose runner it cannot
+  resolve, so a cache step in one of them is not checked.
+- composites are followed three levels deep (a fourth is not), and a composite in another repository
+  (`owner/repo/path@ref`) is not followed. The caller search for an edited `action.yml` looks only at
+  this repository's `.github/workflows`, so a pool job in another repository that calls the action is
+  not found.
+- the store-path tracking follows `run:` text, `env:` and step outputs; a path assembled by a script
+  the workflow downloads, or computed in a different job, is not.
+- relocation is tracked per tool: `pnpm config set store-dir` / `npm_config_store_dir=...` move pnpm,
+  `npm config set cache` / `npm_config_cache=...` move npm. A one-command `VAR=x cmd` prefix applies to
+  that command only and does not relocate later steps.
+- it guards only new edits (see above); a stale branch or default branch that already has the pattern
+  is not stopped, and neither is the corrupting job.
 
 Exempt with `# ci-lint: allow-pnpm-cache <reason>` on the job or in the
 workflow header — a scale set whose store is NOT the shared hostPath, say.

@@ -959,17 +959,22 @@ _SHARED_ROOT_RE = re.compile(r"/var/cache/ci", re.I)
 _STORE_ENV_NAMES = frozenset({"npm_config_store_dir", "npm_config_cache"})
 # A command whose answer IS the shared store on the pool (the env points pnpm/npm at it). Flags may
 # sit between the tool and the subcommand (`pnpm -s store path`, `npm --silent get cache`).
-_STORE_QUERY_RE = re.compile(
-    r"\bpnpm\b(?:\s+-\S+)*\s+(?:store\s+path|(?:config\s+)?get\s+store-dir)\b"
-    r"|\bnpm\b(?:\s+-\S+)*\s+(?:config\s+get|get)\s+cache\b"
+_STORE_QUERY_RES = {
+    "pnpm": re.compile(r"\bpnpm\b(?:\s+-\S+)*\s+(?:store\s+path|(?:config\s+)?get\s+store-dir)\b"),
+    "npm": re.compile(r"\bnpm\b(?:\s+-\S+)*\s+(?:config\s+get|get)\s+cache\b"),
+}
+# A command that points one tool at some other directory for the rest of the job. Relocating pnpm's
+# store says nothing about npm's cache, and the other way round, so each is tracked on its own.
+_STORE_RELOCATE_RES = (
+    ("pnpm", re.compile(r"\bpnpm\b(?:\s+-\S+)*\s+config\s+set\s+store-dir[ =]+(?P<v>\S+)", re.I)),
+    ("npm", re.compile(r"\bnpm\b(?:\s+-\S+)*\s+config\s+set\s+cache[ =]+(?P<v>\S+)", re.I)),
 )
-# A command that points pnpm/npm at some other directory for the rest of the job.
-_STORE_RELOCATE_RE = re.compile(
-    r"\bpnpm\b(?:\s+-\S+)*\s+config\s+set\s+store-dir[ =]+(?P<a>\S+)"
-    r"|\bnpm\b(?:\s+-\S+)*\s+config\s+set\s+cache[ =]+(?P<b>\S+)"
-    r"|\bnpm_config_(?:store_dir|cache)=(?P<c>\S+)",
-    re.I,
-)
+# `npm_config_store_dir=<v>` / `npm_config_cache=<v>` as an assignment, and the tool each one steers.
+_ENV_ASSIGN_RE = re.compile(r"(?P<pre>\S*?)\b(?P<name>npm_config_store_dir|npm_config_cache)=(?P<v>\S*)", re.I)
+_ENV_VAR_TOOL = {"npm_config_store_dir": "pnpm", "npm_config_cache": "npm"}
+# A leading `VAR=x cmd` applies to that one command only: what follows the value is a command word,
+# not a redirect, `&&`, `;` or the end of the line (`export VAR=x`, `echo VAR=x >> $GITHUB_ENV`).
+_ONE_COMMAND_TAIL_RE = re.compile(r"^\s+[A-Za-z_./~$]")
 # steps.s.outputs.x, steps.s.outputs['x'], steps['s'].outputs.x
 _STEP_OUTPUT_REF_RE = re.compile(
     r"""steps(?:\.(?P<dot>[A-Za-z0-9_-]+)|\[\s*['"](?P<br>[A-Za-z0-9_-]+)['"]\s*\])\s*\.\s*outputs\b"""
@@ -1011,7 +1016,6 @@ class _StoreFlow:
     def __init__(self, earlier: list, scopes: tuple) -> None:
         self.names: set[str] = set()
         self.ids: set[str] = set()
-        self.relocated = False
         env = _env_scope_values(*scopes)
         # A pod-provided store var overridden to something outside /var/cache/ci is not the shared store.
         self.local_vars = {
@@ -1019,7 +1023,8 @@ class _StoreFlow:
             for key, value in env.items()
             if key.lower() in _STORE_ENV_NAMES and not _SHARED_ROOT_RE.search(value)
         }
-        self.relocated = bool(self.local_vars)
+        # Tools whose store is moved off the shared root for the rest of the job.
+        self.relocated = {_ENV_VAR_TOOL[name] for name in self.local_vars}
         self._settle_env(env)
         for prior in earlier:
             if isinstance(prior, dict):
@@ -1054,10 +1059,24 @@ class _StoreFlow:
         if not isinstance(run, str):
             return
         for line in _run_lines(run):
-            for move in _STORE_RELOCATE_RE.finditer(line):
-                if not _SHARED_ROOT_RE.search(move.group("a") or move.group("b") or move.group("c") or ""):
-                    self.relocated = True
-            queried = _STORE_QUERY_RE.search(line) is not None and not self.relocated
+            one_command: set[str] = set()
+            for tool, pattern in _STORE_RELOCATE_RES:
+                for move in pattern.finditer(line):
+                    if not _SHARED_ROOT_RE.search(move.group("v")):
+                        self.relocated.add(tool)
+            for move in _ENV_ASSIGN_RE.finditer(line):
+                if _SHARED_ROOT_RE.search(move.group("v")):
+                    continue
+                tool = _ENV_VAR_TOOL[move.group("name").lower()]
+                prefix_form = (
+                    _ONE_COMMAND_TAIL_RE.match(line[move.end() :]) is not None
+                    and (not move.group("pre") or move.group("pre").endswith(("$(", "(", "`")))
+                )
+                (one_command if prefix_form else self.relocated).add(tool)
+            queried = any(
+                pattern.search(line) is not None and tool not in self.relocated and tool not in one_command
+                for tool, pattern in _STORE_QUERY_RES.items()
+            )
             carried = self._value_is_shared(line)
             if not (queried or carried):
                 continue
@@ -1190,6 +1209,7 @@ class _Hit(NamedTuple):
     cause: str
     fix: str
     shared: str  # "pnpm store" | "npm cache" | "package store"
+    origin: tuple[str, int | None] | None = None  # (composite action file, line) when from a composite
 
 
 class _R6Context:
@@ -1366,11 +1386,13 @@ def _step_hits(
         for hit in _step_hits(
             inner_step, list(earlier) + inner[:position], doc, job, action_lines, ctx, depth + 1, seen + (match.group("dir"),)
         ):
-            where = f"{action_path}:{hit.line}" if hit.line else action_path
+            source = hit.origin or (action_path, hit.line)
+            where = f"{source[0]}:{source[1]}" if source[1] else source[0]
             hits.append(
                 hit._replace(
                     line=None,
                     owner=f"`{uses.strip()}` composite action, whose {hit.owner} ({where})",
+                    origin=hit.origin or (action_path, hit.line),
                 )
             )
     return hits
@@ -1466,7 +1488,46 @@ def _r6_finding(
     )
 
 
-def _composite_action_findings(path: str, lines: list[str], doc: dict) -> list[Finding]:
+def _pool_callers_of(action_rel: str, repo_root: Path | None) -> dict[int, tuple[str, str, _Hit]]:
+    """{line in the action: (workflow file, job, hit)} for every pool job in the repo whose call chain
+    reaches an R6 hit on a line of this composite action. First caller per line wins."""
+    out: dict[int, tuple[str, str, _Hit]] = {}
+    if repo_root is None:
+        return out
+    ctx = _R6Context(Path(repo_root))
+    workflows = Path(repo_root) / ".github" / "workflows"
+    files = sorted([*workflows.glob("*.yml"), *workflows.glob("*.yaml")])
+    for file in files:
+        try:
+            text = file.read_text(encoding="utf-8")
+            wdoc = yaml.load(text, Loader=_MarkedLoader)
+        except (OSError, ValueError, yaml.YAMLError):
+            continue
+        if not isinstance(wdoc, dict):
+            continue
+        wlines = text.splitlines()
+        jobs = _jobs(wdoc)
+        if not jobs:
+            continue
+        header_span, job_spans = _marker_spans(wlines, wdoc, jobs)
+        for index, (name, job, _start, _end) in enumerate(jobs):
+            steps = job.get("steps")
+            if not isinstance(steps, list) or not _pool_capable(job.get("runs-on"), wdoc, None):
+                continue
+            if _marker_state(wlines, [header_span, job_spans[index]], _ALLOW_PNPM_CACHE_RE) == "allowed":
+                continue
+            for position, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    continue
+                for hit in _step_hits(step, steps[:position], wdoc, job, wlines, ctx):
+                    if hit.origin and hit.origin[0] == action_rel and hit.origin[1]:
+                        out.setdefault(hit.origin[1], (file.name, name, hit))
+    return out
+
+
+def _composite_action_findings(
+    path: str, lines: list[str], doc: dict, repo_root: Path | None = None
+) -> list[Finding]:
     """A composite action.yml linted on its own: only what is wrong whatever the caller's runner is.
 
     That is a literal `/var/cache/ci` path in an `actions/cache` step. A `cache:` forwarded from an
@@ -1480,6 +1541,7 @@ def _composite_action_findings(path: str, lines: list[str], doc: dict) -> list[F
     ctx = _R6Context(None)
     findings: list[Finding] = []
     steps = [s for s in runs["steps"] if isinstance(s, dict)]
+    reported: set[int] = set()
     for position, step in enumerate(steps):
         resolved = _subst_inputs(step, values)
         hit = _step_hit(resolved, steps[:position], doc, {}, lines, ctx, direct=True)
@@ -1495,6 +1557,7 @@ def _composite_action_findings(path: str, lines: list[str], doc: dict) -> list[F
             continue
         uses_line = _key_line(step, "uses") or step.get(_NODE_START)
         line = hit.line or uses_line
+        reported.add(line)
         findings.append(
             Finding(
                 file=path,
@@ -1511,6 +1574,37 @@ def _composite_action_findings(path: str, lines: list[str], doc: dict) -> list[F
                 anchors=tuple(sorted({line, uses_line} - {None})),
             )
         )
+    # A literal `cache: pnpm` (or `pnpm/action-setup cache: true`) in the action is wrong exactly
+    # when a pool job calls it. A PR that edits only this file never touches that job's workflow,
+    # so the callers in the repo are searched and the finding lands on the action's own line.
+    if repo_root is not None and _marker_state(lines, [(1, len(lines))], _ALLOW_PNPM_CACHE_RE) != "allowed":
+        root_resolved = Path(repo_root).resolve()
+        target = Path(path)
+        try:
+            action_rel = (target if target.is_absolute() else root_resolved / target).resolve()
+            action_rel = action_rel.relative_to(root_resolved).as_posix()
+        except ValueError:
+            return findings
+        for line, (workflow, job_name, hit) in sorted(_pool_callers_of(action_rel, repo_root).items()):
+            if line in reported:
+                continue
+            findings.append(
+                Finding(
+                    file=path,
+                    line=line,
+                    rule=RULE_PNPM_STORE_CACHE,
+                    message=(
+                        f"This composite action's {hit.cause.split(' and ')[0]} is called by job "
+                        f"`{job_name}` in `.github/workflows/{workflow}`, which runs on the "
+                        f"self-hosted pool. Every runner pod on a node shares one {hit.shared} through the "
+                        "`/var/cache/ci` hostPath, so the restore races concurrent installs and can leave "
+                        "CAS names holding another file's bytes (a whole-store restore did exactly that "
+                        "on 2026-11-11)."
+                    ),
+                    fix=f"{hit.fix}\n\n{_PNPM_CACHE_EXEMPTION_HINT}",
+                    anchors=(line,),
+                )
+            )
     return findings
 
 
@@ -2014,7 +2108,9 @@ def lint_text(
     findings += _pnpm_cache_findings(
         path, lines, doc, Path(repo_root) if repo_root is not None else None, caller_values
     )
-    findings += _composite_action_findings(path, lines, doc)
+    findings += _composite_action_findings(
+        path, lines, doc, Path(repo_root) if repo_root is not None else _infer_repo_root(path)
+    )
     return findings
 
 
