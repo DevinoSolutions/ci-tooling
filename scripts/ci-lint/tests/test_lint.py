@@ -3078,11 +3078,108 @@ def test_r6_cache_pnpm_off_the_pool_passes(tmp_path, runs_on):
     assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
 
 
-@pytest.mark.parametrize("with_block", ["", "cache: npm", "cache: yarn", "cache: ''"])
+@pytest.mark.parametrize("with_block", ["", "cache: yarn", "cache: ''"])
 def test_r6_pool_job_without_a_pnpm_cache_passes(tmp_path, with_block):
     p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", with_block=with_block))
     pnpm_package_json(tmp_path)
     assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_cache_npm_on_the_pool_is_reported(tmp_path):
+    """`cache: npm` asks `npm config get cache`, which is /var/cache/ci/npm on the pool."""
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", with_block="cache: npm"))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "shares one npm cache" in found[0].message
+    assert "/var/cache/ci/npm" in found[0].fix
+
+
+def test_r6_cache_npm_off_the_pool_passes(tmp_path):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-latest", with_block="cache: npm"))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def hand_cache_job(runs_on: str, path: str, pre: str = "") -> str:
+    """A one-job workflow with an `actions/cache` step caching `path` (after `pre`, raw step YAML)."""
+    path_lines = "".join(f"            {line}\n" for line in path.splitlines())
+    return (
+        "name: CI\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  test:\n"
+        f"    runs-on: {runs_on}\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        f"{pre}"
+        "      - uses: actions/cache@v4\n"
+        "        with:\n"
+        "          path: |\n"
+        f"{path_lines}"
+        "          key: store-${{ hashFiles('pnpm-lock.yaml') }}\n"
+        "      - run: pnpm install --frozen-lockfile\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/var/cache/ci/pnpm-store",
+        "/var/cache/ci/npm",
+        "/var/cache/ci",
+        "${{ env.npm_config_store_dir }}",
+    ],
+)
+def test_r6_actions_cache_of_a_store_path_on_the_pool_is_reported(tmp_path, path):
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", path))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "`actions/cache` step" in found[0].message
+    assert "Delete this `actions/cache` step" in found[0].fix
+
+
+def test_r6_actions_cache_of_the_pnpm_store_path_output_is_reported(tmp_path):
+    pre = (
+        "      - id: store\n"
+        '        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"\n'
+    )
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", "${{ steps.store.outputs.path }}", pre))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "pnpm store path" in found[0].message
+
+
+def test_r6_actions_cache_of_an_env_var_set_from_pnpm_store_path_is_reported(tmp_path):
+    pre = '      - run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"\n'
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", "${{ env.STORE_PATH }}", pre))
+    assert len(only(run([p]), RULE_PNPM_STORE_CACHE)) == 1
+
+
+@pytest.mark.parametrize("uses", ["actions/cache/restore@v4", "actions/cache/save@v4"])
+def test_r6_actions_cache_restore_and_save_forms_are_reported(tmp_path, uses):
+    body = hand_cache_job("ubuntu-devino", "/var/cache/ci/pnpm-store").replace("actions/cache@v4", uses)
+    assert len(only(run([wf(tmp_path, "ci.yml", body)]), RULE_PNPM_STORE_CACHE)) == 1
+
+
+def test_r6_actions_cache_of_a_store_path_on_a_hosted_runner_passes(tmp_path):
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-latest", "/var/cache/ci/pnpm-store"))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["node_modules", "~/.cache/ms-playwright", "dist\\n.next/cache", ".pnpm-store", "~/.local/share/pnpm/store"],
+)
+def test_r6_actions_cache_of_an_unrelated_path_on_the_pool_passes(tmp_path, path):
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", path))
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_actions_cache_store_path_honours_the_allow_marker(tmp_path):
+    body = hand_cache_job("ubuntu-devino", "/var/cache/ci/pnpm-store").replace(
+        "  test:\n", "  test:\n    # ci-lint: allow-pnpm-cache per-pod emptyDir store on this set\n"
+    )
+    assert only(run([wf(tmp_path, "ci.yml", body)]), RULE_PNPM_STORE_CACHE) == []
 
 
 def test_r6_only_the_pool_job_is_reported_when_a_file_mixes_runners(tmp_path):
@@ -3209,8 +3306,7 @@ def test_r6_setup_node_v5_auto_caching_pnpm_is_reported(tmp_path, setup):
         ("actions/setup-node@v6", "", "pnpm@10.18.0"),
         ("actions/setup-node@v7.1.0", "", "pnpm@10.18.0"),
         ("actions/setup-node@v4", "", "pnpm@10.18.0"),
-        # v5 auto-caching npm or yarn is not this rule's business
-        ("actions/setup-node@v5", "", "npm@11.4.0"),
+        # yarn has no shared directory on the pool
         ("actions/setup-node@v5", "", "yarn@4.9.0"),
         # a sha pin with no version comment is not guessed at
         ("actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444", "", "pnpm@10.18.0"),
@@ -3286,3 +3382,713 @@ def test_r6_baseline_reports_a_newly_added_cache_line_and_not_an_old_one(tmp_pat
     found = only(added, RULE_PNPM_STORE_CACHE)
     assert len(found) == 1
     assert "`e2e`" in found[0].message
+
+
+# -- R6, second round (review of ci-tooling#6): more ways to restore the shared store ------
+
+
+def steps_job(runs_on: str, steps: str, job_extra: str = "", top_extra: str = "") -> str:
+    """A one-job workflow around raw step YAML (steps are written at 6 spaces of indent)."""
+    body = "".join(f"      {line}\n" if line else "\n" for line in textwrap.dedent(steps).strip("\n").splitlines())
+    return (
+        "name: CI\n"
+        "on:\n"
+        "  pull_request:\n"
+        f"{top_extra}"
+        "jobs:\n"
+        "  test:\n"
+        f"    runs-on: {runs_on}\n"
+        f"{job_extra}"
+        "    steps:\n"
+        f"{body}"
+    )
+
+
+def r6(tmp_path, body, name="ci.yml"):
+    return only(run([wf(tmp_path, name, body)]), RULE_PNPM_STORE_CACHE)
+
+
+@pytest.mark.parametrize("uses", ["pnpm/action-setup@v4", "pnpm/action-setup@v5", "pnpm/action-setup@v6", "PNPM/action-setup@v4"])
+@pytest.mark.parametrize("value", ["true", "'true'", "True"])
+def test_r6_pnpm_action_setup_with_cache_on_the_pool_is_reported(tmp_path, uses, value):
+    found = r6(tmp_path, steps_job("ubuntu-devino", f"- uses: {uses}\n  with:\n    cache: {value}\n"))
+    assert len(found) == 1
+    assert "`pnpm/action-setup` step" in found[0].message
+    assert "ERR_PNPM_ENOENT" in found[0].message
+
+
+@pytest.mark.parametrize("with_block", ["", "  with:\n    version: 10\n", "  with:\n    cache: false\n", "  with:\n    cache: 'false'\n"])
+def test_r6_pnpm_action_setup_without_cache_passes(tmp_path, with_block):
+    assert r6(tmp_path, steps_job("ubuntu-devino", "- uses: pnpm/action-setup@v4\n" + with_block)) == []
+
+
+def test_r6_pnpm_action_setup_cache_on_a_hosted_runner_passes(tmp_path):
+    assert r6(tmp_path, steps_job("ubuntu-latest", "- uses: pnpm/action-setup@v4\n  with:\n    cache: true\n")) == []
+
+
+@pytest.mark.parametrize("major", ["v5", "v6", "v7"])
+@pytest.mark.parametrize("manager", ["npm@10.9.0", "^npm@10.9.0", "npm"])
+def test_r6_setup_node_auto_caching_npm_is_reported_on_every_major_that_has_it(tmp_path, major, manager):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", setup=f"actions/setup-node@{major}", with_block=""))
+    pnpm_package_json(tmp_path, manager)
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    if major == "v5" and manager == "npm":
+        assert found == []  # v5 only matches `npm@...`; bare `npm` is a v6+ spelling
+        return
+    assert len(found) == 1
+    assert f"setup-node {major[0]}{major[1:]}" in found[0].message
+    assert "auto-caches npm" in found[0].message
+    assert "pnpm" not in found[0].message.split("Every runner pod")[0].replace("pnpm/action-setup", "")
+
+
+@pytest.mark.parametrize(
+    "dev_engines",
+    [
+        '{"packageManager": {"name": "npm", "version": "10.9.0"}}',
+        '{"packageManager": [{"name": "yarn"}, {"name": "npm"}]}',
+    ],
+)
+def test_r6_setup_node_v6_auto_caching_from_dev_engines_is_reported(tmp_path, dev_engines):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", setup="actions/setup-node@v6", with_block=""))
+    (tmp_path / "package.json").write_text('{"name": "x", "devEngines": %s}\n' % dev_engines, encoding="utf-8")
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "devEngines.packageManager" in found[0].message
+
+
+@pytest.mark.parametrize(
+    "dev_engines",
+    ['{"packageManager": {"name": "pnpm"}}', '{"packageManager": [{"name": "yarn"}]}', '{"runtime": {"name": "node"}}'],
+)
+def test_r6_setup_node_v6_dev_engines_naming_another_manager_passes(tmp_path, dev_engines):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", setup="actions/setup-node@v6", with_block=""))
+    (tmp_path / "package.json").write_text('{"name": "x", "devEngines": %s}\n' % dev_engines, encoding="utf-8")
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_setup_node_v6_auto_cache_switched_off_passes(tmp_path):
+    p = wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", setup="actions/setup-node@v6", with_block="package-manager-cache: false"))
+    pnpm_package_json(tmp_path, "npm@10.9.0")
+    assert only(run([p]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_cache_npm_message_does_not_cite_pnpm(tmp_path):
+    found = only(run([wf(tmp_path, "ci.yml", pnpm_job("ubuntu-devino", with_block="cache: npm"))]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "pnpm" not in found[0].message.lower().replace("pnpm/action-setup", "")
+    assert "pnpm" not in found[0].fix.split("If this job")[0].lower()
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "${{ steps.store.outputs['path'] }}",
+        "${{ steps['store'].outputs.path }}",
+        '${{ steps["store"].outputs["path"] }}',
+    ],
+)
+def test_r6_bracket_syntax_for_a_step_output_is_followed(tmp_path, ref):
+    pre = '      - id: store\n        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"\n'
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", ref, pre))) == 1
+
+
+@pytest.mark.parametrize("ref", ["${{ env['STORE_PATH'] }}", '${{ env["STORE_PATH"] }}'])
+def test_r6_bracket_syntax_for_an_env_var_is_followed(tmp_path, ref):
+    pre = '      - run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"\n'
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", ref, pre))) == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "pnpm store path",
+        "pnpm -s store path",
+        "pnpm --silent store path",
+        "pnpm store path --silent",
+        "pnpm config get store-dir",
+        "npm config get cache",
+        "npm get cache",
+        "npm -s config get cache",
+    ],
+)
+def test_r6_every_spelling_of_the_store_query_is_followed(tmp_path, query):
+    pre = f'      - id: s\n        run: echo "dir=$({query})" >> "$GITHUB_OUTPUT"\n'
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre))) == 1
+
+
+def test_r6_an_env_var_set_from_a_step_output_is_followed(tmp_path):
+    steps = """
+        - id: s
+          run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+        - uses: actions/cache@v4
+          env:
+            STORE: ${{ steps.s.outputs.dir }}
+          with:
+            path: ${{ env.STORE }}
+            key: k
+    """
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", steps))) == 1
+
+
+def test_r6_github_env_handed_on_through_github_output_is_followed(tmp_path):
+    steps = """
+        - run: echo "STORE=$(pnpm store path)" >> "$GITHUB_ENV"
+        - id: t
+          run: echo "dir=$STORE" >> "$GITHUB_OUTPUT"
+        - uses: actions/cache@v4
+          with:
+            path: ${{ steps.t.outputs.dir }}
+            key: k
+    """
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", steps))) == 1
+
+
+def test_r6_a_shell_variable_chain_inside_one_step_is_followed(tmp_path):
+    steps = """
+        - id: s
+          run: |
+            DIR=$(pnpm store path)
+            echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+        - uses: actions/cache@v4
+          with:
+            path: ${{ steps.s.outputs.dir }}
+            key: k
+    """
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", steps))) == 1
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["workflow", "job", "step"],
+)
+def test_r6_a_store_path_set_in_any_env_scope_is_followed(tmp_path, where):
+    cache = "- uses: actions/cache@v4\n  with:\n    path: ${{ env.STORE }}\n    key: k\n"
+    env_line = "  STORE: /var/cache/ci/pnpm-store\n"
+    if where == "workflow":
+        body = steps_job("ubuntu-devino", cache, top_extra="").replace("jobs:\n", "env:\n" + env_line + "jobs:\n", 1)
+    elif where == "job":
+        body = steps_job("ubuntu-devino", cache, job_extra="    env:\n      STORE: /var/cache/ci/pnpm-store\n")
+    else:
+        body = steps_job("ubuntu-devino", cache.replace("  with:", "  env:\n    STORE: /var/cache/ci/pnpm-store\n  with:"))
+    assert len(r6(tmp_path, body)) == 1
+
+
+def test_r6_a_store_query_after_the_cache_step_does_not_count(tmp_path):
+    """The step output is read before it is written: the cache step cannot be caching it."""
+    steps = """
+        - uses: actions/cache@v4
+          with:
+            path: ${{ steps.s.outputs.dir }}
+            key: k
+        - id: s
+          run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"
+    """
+    assert r6(tmp_path, steps_job("ubuntu-devino", steps)) == []
+
+
+@pytest.mark.parametrize("name", ["npm_config_cache", "npm_config_store_dir"])
+def test_r6_the_pool_provided_store_env_vars_are_both_the_shared_store(tmp_path, name):
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ env.%s }}" % name))) == 1
+
+
+def test_r6_npm_config_get_cache_output_is_the_shared_npm_cache(tmp_path):
+    pre = '      - id: s\n        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"\n'
+    found = r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre))
+    assert len(found) == 1
+    assert "npm config get cache" in found[0].message
+
+
+@pytest.mark.parametrize(
+    "uses",
+    ["Actions/Cache@v4", "ACTIONS/CACHE/RESTORE@v4", "useblacksmith/cache@v5", "runs-on/cache@v4", "buildjet/cache/save@v4"],
+)
+def test_r6_cache_actions_match_case_insensitively_and_by_the_cache_name(tmp_path, uses):
+    body = hand_cache_job("ubuntu-devino", "/var/cache/ci/pnpm-store").replace("actions/cache@v4", uses)
+    assert len(r6(tmp_path, body)) == 1
+
+
+@pytest.mark.parametrize("uses", ["actions/checkout@v4", "someone/cache-helper@v1", "x/cached@v1"])
+def test_r6_other_actions_are_not_cache_actions(tmp_path, uses):
+    body = hand_cache_job("ubuntu-devino", "/var/cache/ci/pnpm-store").replace("actions/cache@v4", uses)
+    assert r6(tmp_path, body) == []
+
+
+def test_r6_setup_node_matches_case_insensitively(tmp_path):
+    body = pnpm_job("ubuntu-devino", setup="Actions/Setup-Node@v4")
+    assert len(r6(tmp_path, body)) == 1
+
+
+def test_r6_a_multi_line_path_reports_the_offending_line(tmp_path):
+    p = wf(tmp_path, "ci.yml", hand_cache_job("ubuntu-devino", "~/.cache/Cypress\n/var/cache/ci/pnpm-store\nnode_modules"))
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert p.read_text(encoding="utf-8").splitlines()[found[0].line - 1].strip() == "/var/cache/ci/pnpm-store"
+    assert "path: /var/cache/ci/pnpm-store" in found[0].message
+
+
+# False positives the review found.
+
+
+@pytest.mark.parametrize(
+    "env_value",
+    ["${{ github.workspace }}/.pnpm-store", "$GITHUB_WORKSPACE/.pnpm-store", "/home/runner/.local/share/pnpm"],
+)
+@pytest.mark.parametrize("scope", ["job", "step"])
+def test_r6_a_store_env_var_pointing_outside_the_shared_root_is_not_the_shared_store(tmp_path, env_value, scope):
+    if scope == "job":
+        body = hand_cache_job("ubuntu-devino", "${{ env.npm_config_store_dir }}").replace(
+            "    steps:\n", f"    env:\n      npm_config_store_dir: {env_value}\n    steps:\n", 1
+        )
+    else:
+        body = hand_cache_job("ubuntu-devino", "${{ env.npm_config_store_dir }}").replace(
+            "        with:\n          path: |", f"        env:\n          npm_config_store_dir: {env_value}\n        with:\n          path: |"
+        )
+    assert r6(tmp_path, body) == []
+
+
+def test_r6_a_store_env_var_overridden_to_the_shared_root_is_still_the_shared_store(tmp_path):
+    body = hand_cache_job("ubuntu-devino", "${{ env.npm_config_store_dir }}").replace(
+        "    steps:\n", "    env:\n      npm_config_store_dir: /var/cache/ci/pnpm-store\n    steps:\n", 1
+    )
+    assert len(r6(tmp_path, body)) == 1
+
+
+def test_r6_only_the_variable_assigned_from_the_store_path_is_the_store(tmp_path):
+    pre = (
+        "      - run: |\n"
+        "          pnpm store path\n"
+        '          echo "CYPRESS=$HOME/.cache/Cypress" >> "$GITHUB_ENV"\n'
+    )
+    assert r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ env.CYPRESS }}", pre)) == []
+
+
+def test_r6_the_variable_assigned_on_the_same_line_as_the_store_path_is_the_store(tmp_path):
+    pre = (
+        "      - run: |\n"
+        '          echo "CYPRESS=$HOME/.cache/Cypress" >> "$GITHUB_ENV"\n'
+        '          echo "STORE=$(pnpm store path)" >> "$GITHUB_ENV"\n'
+    )
+    assert r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ env.CYPRESS }}", pre)) == []
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ env.STORE }}", pre), name="b.yml")) == 1
+
+
+@pytest.mark.parametrize(
+    "relocate",
+    [
+        "pnpm config set store-dir $GITHUB_WORKSPACE/.pnpm-store",
+        "pnpm config set store-dir ${{ github.workspace }}/.pnpm-store",
+        'echo "npm_config_store_dir=$GITHUB_WORKSPACE/.pnpm-store" >> "$GITHUB_ENV"',
+    ],
+)
+def test_r6_a_store_moved_into_the_workspace_before_the_query_is_not_the_shared_store(tmp_path, relocate):
+    pre = (
+        f"      - run: {relocate}\n"
+        "      - id: s\n"
+        '        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"\n'
+    )
+    assert r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre)) == []
+
+
+def test_r6_a_store_set_to_the_shared_root_before_the_query_is_still_shared(tmp_path):
+    pre = (
+        "      - run: pnpm config set store-dir /var/cache/ci/pnpm-store\n"
+        "      - id: s\n"
+        '        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"\n'
+    )
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre))) == 1
+
+
+# Composite actions.
+
+
+def write_action(root: Path, name: str, body: str) -> None:
+    d = root / ".github" / "actions" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "action.yml").write_text(textwrap.dedent(body).lstrip("\n"), encoding="utf-8", newline="\n")
+
+
+SETUP_ACTION = """
+    name: setup
+    inputs:
+      cache:
+        default: ''
+    runs:
+      using: composite
+      steps:
+        - uses: actions/setup-node@v4
+          with:
+            node-version: 22
+            cache: ${{ inputs.cache }}
+"""
+
+
+def test_r6_a_pool_job_passing_cache_pnpm_into_a_composite_is_reported_at_the_call(tmp_path):
+    write_action(tmp_path, "setup", SETUP_ACTION)
+    body = steps_job("ubuntu-devino", "- uses: ./.github/actions/setup\n  with:\n    cache: pnpm\n")
+    p = wf(tmp_path, "ci.yml", body)
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert p.read_text(encoding="utf-8").splitlines()[found[0].line - 1].strip() == "- uses: ./.github/actions/setup"
+    assert ".github/actions/setup/action.yml" in found[0].message
+    assert "`actions/setup-node` step" in found[0].message
+
+
+def test_r6_a_composite_whose_input_default_is_pnpm_is_reported_when_the_caller_passes_nothing(tmp_path):
+    write_action(tmp_path, "setup", SETUP_ACTION.replace("default: ''", "default: pnpm"))
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/setup\n"))) == 1
+
+
+def test_r6_a_composite_called_with_no_cache_passes(tmp_path):
+    write_action(tmp_path, "setup", SETUP_ACTION)
+    assert r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/setup\n")) == []
+
+
+def test_r6_a_composite_called_from_a_hosted_job_passes(tmp_path):
+    write_action(tmp_path, "setup", SETUP_ACTION)
+    assert r6(tmp_path, steps_job("ubuntu-latest", "- uses: ./.github/actions/setup\n  with:\n    cache: pnpm\n")) == []
+
+
+def test_r6_a_composite_with_a_literal_cache_pnpm_is_reported_for_the_pool_caller(tmp_path):
+    write_action(
+        tmp_path,
+        "setup",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: actions/setup-node@v4
+              with:
+                cache: pnpm
+        """,
+    )
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/setup\n"))) == 1
+    assert r6(tmp_path, steps_job("ubuntu-latest", "- uses: ./.github/actions/setup\n"), name="b.yml") == []
+
+
+def test_r6_a_composite_calling_a_composite_is_followed(tmp_path):
+    write_action(tmp_path, "setup", SETUP_ACTION)
+    write_action(
+        tmp_path,
+        "outer",
+        """
+        inputs:
+          mgr:
+            default: pnpm
+        runs:
+          using: composite
+          steps:
+            - uses: ./.github/actions/setup
+              with:
+                cache: ${{ inputs.mgr }}
+        """,
+    )
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/outer\n"))) == 1
+
+
+def test_r6_a_composite_that_calls_itself_does_not_loop(tmp_path):
+    write_action(
+        tmp_path,
+        "loop",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: ./.github/actions/loop
+        """,
+    )
+    assert r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/loop\n")) == []
+
+
+def test_r6_a_composite_path_cannot_leave_the_repository(tmp_path):
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps:\n    - uses: actions/setup-node@v4\n      with:\n        cache: pnpm\n",
+        encoding="utf-8",
+    )
+    assert r6(repo, steps_job("ubuntu-devino", "- uses: ./../outside\n")) == []
+
+
+def test_r6_excluded_path_lines_are_not_the_cache(tmp_path):
+    assert r6(tmp_path, hand_cache_job("ubuntu-devino", "node_modules\n!/var/cache/ci/pnpm-store")) == []
+
+
+def test_r6_a_composite_hand_cache_of_the_shared_store_is_reported_for_the_pool_caller(tmp_path):
+    write_action(
+        tmp_path,
+        "warm",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: /var/cache/ci/pnpm-store
+                key: k
+        """,
+    )
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/warm\n"))) == 1
+
+
+def test_r6_a_composite_action_file_with_a_literal_shared_store_cache_is_reported_on_its_own(tmp_path):
+    write_action(
+        tmp_path,
+        "warm",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: |
+                  ~/.cache/Cypress
+                  /var/cache/ci/pnpm-store
+                key: k
+        """,
+    )
+    p = tmp_path / ".github" / "actions" / "warm" / "action.yml"
+    found = only(run([p]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert p.read_text(encoding="utf-8").splitlines()[found[0].line - 1].strip() == "/var/cache/ci/pnpm-store"
+    assert "composite action" in found[0].message
+
+
+def test_r6_a_composite_action_file_forwarding_a_cache_input_defaulting_to_pnpm_is_reported(tmp_path):
+    write_action(tmp_path, "setup", SETUP_ACTION.replace("default: ''", "default: pnpm"))
+    found = only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert "forwards" in found[0].message
+
+
+@pytest.mark.parametrize("default", ["''", "yarn"])
+def test_r6_a_composite_action_file_forwarding_a_harmless_default_passes(tmp_path, default):
+    write_action(tmp_path, "setup", SETUP_ACTION.replace("default: ''", f"default: {default}"))
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_a_composite_action_file_with_a_literal_cache_pnpm_is_left_to_the_calling_job(tmp_path):
+    """A hosted caller may use it correctly; the pool job that calls it is the one reported."""
+    write_action(
+        tmp_path,
+        "setup",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: actions/setup-node@v4
+              with:
+                cache: pnpm
+        """,
+    )
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_a_non_composite_action_file_is_not_a_finding(tmp_path):
+    write_action(tmp_path, "js", "name: js\nruns:\n  using: node20\n  main: index.js\n")
+    assert run([tmp_path / ".github" / "actions" / "js" / "action.yml"]) == []
+
+
+def test_r6_a_composite_calling_itself_is_reported_once_not_once_per_level(tmp_path):
+    write_action(
+        tmp_path,
+        "loop",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: actions/setup-node@v4
+              with:
+                cache: pnpm
+            - uses: ./.github/actions/loop
+        """,
+    )
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/loop\n"))) == 1
+
+
+def test_r6_a_job_env_store_path_handed_to_a_step_output_is_followed(tmp_path):
+    steps = """
+        - id: t
+          run: echo "dir=$STORE" >> "$GITHUB_OUTPUT"
+        - uses: actions/cache@v4
+          with:
+            path: ${{ steps.t.outputs.dir }}
+            key: k
+    """
+    body = steps_job("ubuntu-devino", steps, job_extra="    env:\n      STORE: /var/cache/ci/pnpm-store\n")
+    assert len(r6(tmp_path, body)) == 1
+
+
+# -- R6, third round: depth, relocation per tool, a PR that edits only a composite action -----
+
+
+def _chain(tmp_path, levels: int, leaf: str) -> None:
+    """action `c1` calls `c2` ... calls `c<levels>`, whose steps are `leaf`."""
+    for level in range(1, levels):
+        write_action(
+            tmp_path,
+            f"c{level}",
+            f"runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/c{level + 1}\n",
+        )
+    write_action(tmp_path, f"c{levels}", leaf)
+
+
+LEAF_CACHE_PNPM = """
+    runs:
+      using: composite
+      steps:
+        - uses: actions/setup-node@v4
+          with:
+            cache: pnpm
+"""
+
+
+def test_r6_a_cache_step_exactly_three_composite_levels_deep_is_reported(tmp_path):
+    _chain(tmp_path, 3, LEAF_CACHE_PNPM)
+    assert len(r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/c1\n"))) == 1
+
+
+def test_r6_a_cache_step_four_composite_levels_deep_is_beyond_the_limit(tmp_path):
+    """Documented limit: three levels are followed, a fourth is not."""
+    _chain(tmp_path, 4, LEAF_CACHE_PNPM)
+    assert r6(tmp_path, steps_job("ubuntu-devino", "- uses: ./.github/actions/c1\n")) == []
+
+
+def _shell(tmp_path, command: str, query: str, cache_path: str):
+    pre = f"      - run: {command}\n      - id: s\n        run: echo \"dir=$({query})\" >> \"$GITHUB_OUTPUT\"\n"
+    return r6(tmp_path, hand_cache_job("ubuntu-devino", cache_path, pre))
+
+
+def test_r6_moving_npm_does_not_move_pnpm(tmp_path):
+    found = _shell(tmp_path, "npm config set cache $GITHUB_WORKSPACE/.npm", "pnpm store path", "${{ steps.s.outputs.dir }}")
+    assert len(found) == 1
+
+
+def test_r6_moving_pnpm_does_not_move_npm(tmp_path):
+    found = _shell(tmp_path, "pnpm config set store-dir $GITHUB_WORKSPACE/.pnpm-store", "npm config get cache", "${{ steps.s.outputs.dir }}")
+    assert len(found) == 1
+
+
+def test_r6_moving_npm_moves_the_npm_query(tmp_path):
+    assert _shell(tmp_path, "npm config set cache $GITHUB_WORKSPACE/.npm", "npm config get cache", "${{ steps.s.outputs.dir }}") == []
+
+
+@pytest.mark.parametrize(
+    "scope_name, query, expect",
+    [
+        ("npm_config_cache", "pnpm store path", 1),
+        ("npm_config_store_dir", "npm config get cache", 1),
+        ("npm_config_cache", "npm config get cache", 0),
+        ("npm_config_store_dir", "pnpm store path", 0),
+    ],
+)
+def test_r6_a_job_env_override_moves_only_its_own_tool(tmp_path, scope_name, query, expect):
+    body = hand_cache_job(
+        "ubuntu-devino",
+        "${{ steps.s.outputs.dir }}",
+        f"      - id: s\n        run: echo \"dir=$({query})\" >> \"$GITHUB_OUTPUT\"\n",
+    ).replace("    steps:\n", f"    env:\n      {scope_name}: ${{{{ github.workspace }}}}/local\n    steps:\n", 1)
+    assert len(r6(tmp_path, body)) == expect
+
+
+def test_r6_a_one_command_env_prefix_does_not_relocate_later_queries(tmp_path):
+    """`VAR=x cmd` applies to that command alone; the query two steps later still reads the shared store."""
+    found = _shell(
+        tmp_path,
+        "npm_config_store_dir=$GITHUB_WORKSPACE/.pnpm-store pnpm install --frozen-lockfile",
+        "pnpm store path",
+        "${{ steps.s.outputs.dir }}",
+    )
+    assert len(found) == 1
+
+
+def test_r6_a_one_command_env_prefix_on_the_query_itself_is_not_the_shared_store(tmp_path):
+    pre = '      - id: s\n        run: dir=$(npm_config_store_dir=$GITHUB_WORKSPACE/.s pnpm store path) && echo "dir=$dir" >> "$GITHUB_OUTPUT"\n'
+    assert r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre)) == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'export npm_config_store_dir=$GITHUB_WORKSPACE/.s',
+        'echo "npm_config_store_dir=$GITHUB_WORKSPACE/.s" >> "$GITHUB_ENV"',
+        "export npm_config_store_dir=$GITHUB_WORKSPACE/.s && true",
+    ],
+)
+def test_r6_exported_or_persisted_env_assignments_still_relocate(tmp_path, command):
+    assert _shell(tmp_path, command, "pnpm store path", "${{ steps.s.outputs.dir }}") == []
+
+
+# A PR that edits only the composite action.
+
+
+POOL_CALLER = "- uses: ./.github/actions/setup\n"
+
+
+def test_r6_editing_only_a_composite_to_add_cache_pnpm_is_reported_when_a_pool_job_calls_it(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", POOL_CALLER))
+    action = tmp_path / ".github" / "actions" / "setup" / "action.yml"
+    found = only(run([action]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert action.read_text(encoding="utf-8").splitlines()[found[0].line - 1].strip() == "cache: pnpm"
+    assert "`test`" in found[0].message and "ci.yml" in found[0].message
+
+
+def test_r6_editing_only_a_composite_to_add_pnpm_action_setup_cache_is_reported(tmp_path):
+    write_action(
+        tmp_path,
+        "setup",
+        """
+        runs:
+          using: composite
+          steps:
+            - uses: pnpm/action-setup@v4
+              with:
+                cache: true
+        """,
+    )
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", POOL_CALLER))
+    action = tmp_path / ".github" / "actions" / "setup" / "action.yml"
+    found = only(run([action]), RULE_PNPM_STORE_CACHE)
+    assert len(found) == 1
+    assert action.read_text(encoding="utf-8").splitlines()[found[0].line - 1].strip() == "cache: true"
+
+
+def test_r6_editing_only_a_composite_called_only_from_hosted_jobs_passes(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-latest", POOL_CALLER))
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_editing_only_a_composite_nobody_calls_passes(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", "- run: echo hi\n"))
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_editing_only_an_inner_composite_is_reported_through_the_outer_one(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    write_action(tmp_path, "outer", "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/setup\n")
+    wf(tmp_path, "ci.yml", steps_job("ubuntu-devino", "- uses: ./.github/actions/outer\n"))
+    action = tmp_path / ".github" / "actions" / "setup" / "action.yml"
+    assert len(only(run([action]), RULE_PNPM_STORE_CACHE)) == 1
+    assert only(run([tmp_path / ".github" / "actions" / "outer" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_a_pool_job_exempted_with_the_marker_does_not_make_the_composite_a_finding(tmp_path):
+    write_action(tmp_path, "setup", LEAF_CACHE_PNPM)
+    body = steps_job("ubuntu-devino", POOL_CALLER).replace(
+        "  test:\n", "  test:\n    # ci-lint: allow-pnpm-cache per-pod emptyDir store on this set\n"
+    )
+    wf(tmp_path, "ci.yml", body)
+    assert only(run([tmp_path / ".github" / "actions" / "setup" / "action.yml"]), RULE_PNPM_STORE_CACHE) == []
+
+
+def test_r6_a_one_command_prefix_inside_a_substitution_does_not_relocate_a_later_query(tmp_path):
+    pre = (
+        "      - run: probe=$(npm_config_store_dir=$GITHUB_WORKSPACE/.s pnpm store path)\n"
+        "      - id: s\n"
+        '        run: echo "dir=$(pnpm store path)" >> "$GITHUB_OUTPUT"\n'
+    )
+    assert len(r6(tmp_path, hand_cache_job("ubuntu-devino", "${{ steps.s.outputs.dir }}", pre))) == 1
