@@ -161,7 +161,7 @@ jobs:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           set -euo pipefail
-          git diff --name-only --diff-filter=ACMR "${BASE_SHA}...HEAD" -- .github/workflows > ci-lint-changed.txt
+          git diff --name-only --diff-filter=ACMR "${BASE_SHA}...HEAD" -- .github/workflows ':(glob).github/actions/**/action.yml' ':(glob).github/actions/**/action.yaml' > ci-lint-changed.txt
           count="$(wc -l < ci-lint-changed.txt | tr -d ' ')"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
           echo "${count} changed workflow file(s) against ${BASE_SHA}"

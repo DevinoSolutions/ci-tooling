@@ -15,12 +15,14 @@ ruleset, so that the savings W1-W4 land are not undone by the next PR.
     R4  caller-permissions    a job calling a reusable workflow without holding
                               the permissions that workflow declares, which
                               fails the run at startup with nothing to read
-    R6  pnpm-store-cache      a self-hosted job whose `actions/setup-node`
-                              restores the pnpm or npm cache (`cache: pnpm|npm`,
-                              or v5's automatic pnpm caching), or whose
-                              `actions/cache` step caches the shared store path
-                              (`/var/cache/ci`, `pnpm store path`, ...), over the
-                              store every pod on the node shares
+    R6  pnpm-store-cache      a self-hosted job whose `actions/setup-node` or
+                              `pnpm/action-setup` step restores the pnpm or npm
+                              cache (`cache: pnpm|npm`, or setup-node's automatic
+                              caching), or whose `actions/cache` (or fork) step
+                              caches the shared store path (`/var/cache/ci`,
+                              `pnpm store path`, ...), directly or through a local
+                              composite action, over the store every pod on the
+                              node shares
 
 WHY LINE NUMBERS, NOT JUST FILES. Adoption is incremental: a repo drops a
 `.github/ci-lint-baseline` file naming the sha at which it was migrated, and
@@ -52,6 +54,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -871,24 +874,27 @@ def _bun_engine_findings(
 # (`package-manager-cache`, default true) for whichever of npm/yarn/pnpm the root
 # package.json's `packageManager` names. v6.0.0 narrowed that to npm only
 # (actions/setup-node#1374, "Limit automatic caching to npm"), and v7 keeps the
-# npm-only rule. So a v5 step with no `cache:` input still restores the pnpm
-# store when `packageManager` is `pnpm@...`; v4 and below, and v6 and above, do not.
+# npm-only rule; v6+ also reads `devEngines.packageManager`. So a v5 step with no
+# `cache:` input still restores the pnpm store when `packageManager` is `pnpm@...`
+# (and the npm cache when it is `npm@...`), v6 and v7 restore the npm cache for npm,
+# and v4 and below do nothing. All of it read from the action's own source.
+#
+# What this rule can NOT do. It runs on pull requests, against the files and lines
+# the PR touches. It does not stop a stale branch or a default branch that already
+# has the pattern, and it cannot stop the corrupting job from running. Detection of
+# the damage is the host watchdog's job (ci-store-watchdog on each node).
 
 RULE_PNPM_STORE_CACHE = "pnpm-store-cache"
 ALLOW_PNPM_CACHE_MARKER = "allow-pnpm-cache"
 WRITTEN_PNPM_CACHE_MARKER = f"ci-lint: {ALLOW_PNPM_CACHE_MARKER}"
 _ALLOW_PNPM_CACHE_RE = _marker_re(ALLOW_PNPM_CACHE_MARKER)
 
-_SETUP_NODE_REF_RE = re.compile(r"^actions/setup-node@(?P<ref>\S+)$")
+_SETUP_NODE_REF_RE = re.compile(r"^actions/setup-node@(?P<ref>\S+)$", re.I)
 _MAJOR_RE = re.compile(r"^v?(?P<major>\d+)(?:\.\d+)*$")
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # A sha-pinned `uses:` carries its version as a trailing comment, which YAML drops,
 # so it is read from the raw line: `uses: actions/setup-node@<sha> # v5.0.0`.
 _PIN_COMMENT_RE = re.compile(r"#\s*v?(?P<major>\d+)(?:\.\d+)*\b")
-# setup-node v5's own reading of `packageManager`: `^(?:\^)?(npm|yarn|pnpm)@`.
-_PNPM_PACKAGE_MANAGER_RE = re.compile(r"^\^?pnpm@")
-# The setup-node majors whose automatic caching covers pnpm: v5 only.
-_AUTO_CACHE_PNPM_MAJORS = frozenset({5})
 
 
 def _setup_node_major(uses: str, raw_line: str) -> int | None:
@@ -926,52 +932,183 @@ def _cache_names_npm(value) -> bool:
     return value.strip().lower() == "npm"
 
 
+def _truthy_input(value) -> bool:
+    """A boolean action input spelled the ways GitHub accepts; an unresolved expression is not guessed at."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str) and not is_expression(value):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
 # An `actions/cache` step whose `path:` is the node's shared package store. Same hazard as
 # setup-node's `cache:`, spelled by hand: a save uploads the whole shared store, a restore
 # extracts it over files sibling pods are hard-linking out of. On 2026-11-11 such a restore
 # rewrote ~340k files in the forth store and left six CAS names holding another file's bytes.
-_ACTIONS_CACHE_RE = re.compile(r"^actions/cache(?:/(?:restore|save))?@")
-# A path that names the shared hostPath directly, or the env var pnpm/npm read it from. A
-# workspace-local `.pnpm-store` or `~/.local/share/pnpm` is not shared on the pool, so it is not matched.
-_STORE_PATH_LITERAL_RE = re.compile(r"/var/cache/ci|npm_config_store_dir|npm_config_cache", re.I)
-# A command whose answer IS the shared store on the pool (the env points pnpm/npm at it).
+# GitHub resolves `owner/repo` case-insensitively, and the cache forks people reach for
+# (useblacksmith/cache, runs-on/cache, buildjet/cache) are all `<owner>/cache[/restore|/save]`.
+_ACTIONS_CACHE_RE = re.compile(r"^[^@\s]+/cache(?:/(?:restore|save))?@", re.I)
+_SETUP_NODE_CACHE_RE = re.compile(r"^actions/setup-node@", re.I)
+_PNPM_ACTION_SETUP_RE = re.compile(r"^pnpm/action-setup@", re.I)
+# The shared hostPath. A workspace-local `.pnpm-store` or `~/.local/share/pnpm` is not shared on the pool.
+_SHARED_ROOT_RE = re.compile(r"/var/cache/ci", re.I)
+# The env vars pnpm/npm read their store from. The pool's pods set them to the shared hostPath,
+# so a workflow that does not override them reads the shared store through them.
+_STORE_ENV_NAMES = frozenset({"npm_config_store_dir", "npm_config_cache"})
+# A command whose answer IS the shared store on the pool (the env points pnpm/npm at it). Flags may
+# sit between the tool and the subcommand (`pnpm -s store path`, `npm --silent get cache`).
 _STORE_QUERY_RE = re.compile(
-    r"\bpnpm\s+(?:store\s+path|config\s+get\s+store-dir)\b|\bnpm\s+config\s+get\s+cache\b"
+    r"\bpnpm\b(?:\s+-\S+)*\s+(?:store\s+path|(?:config\s+)?get\s+store-dir)\b"
+    r"|\bnpm\b(?:\s+-\S+)*\s+(?:config\s+get|get)\s+cache\b"
 )
-_STEP_OUTPUT_REF_RE = re.compile(r"steps\.([A-Za-z0-9_-]+)\.outputs\.")
-_ENV_NAME_REF_RE = re.compile(r"(?:\benv\.|\$\{?)([A-Za-z_][A-Za-z0-9_]*)")
+# A command that points pnpm/npm at some other directory for the rest of the job.
+_STORE_RELOCATE_RE = re.compile(
+    r"\bpnpm\b(?:\s+-\S+)*\s+config\s+set\s+store-dir[ =]+(?P<a>\S+)"
+    r"|\bnpm\b(?:\s+-\S+)*\s+config\s+set\s+cache[ =]+(?P<b>\S+)"
+    r"|\bnpm_config_(?:store_dir|cache)=(?P<c>\S+)",
+    re.I,
+)
+# steps.s.outputs.x, steps.s.outputs['x'], steps['s'].outputs.x
+_STEP_OUTPUT_REF_RE = re.compile(
+    r"""steps(?:\.(?P<dot>[A-Za-z0-9_-]+)|\[\s*['"](?P<br>[A-Za-z0-9_-]+)['"]\s*\])\s*\.\s*outputs\b"""
+)
+# env.X, env['X'], $X, ${X}
+_ENV_NAME_REF_RE = re.compile(
+    r"""(?:\benv\.|\$\{?)(?P<dot>[A-Za-z_][A-Za-z0-9_]*)|\benv\[\s*['"](?P<br>[A-Za-z_][A-Za-z0-9_]*)['"]\s*\]"""
+)
 _ASSIGNED_NAME_RE = re.compile(r"""(?m)(?:^|[\s;"'])([A-Za-z_][A-Za-z0-9_]*)=""")
+_OUTPUT_SINK_RE = re.compile(r"GITHUB_OUTPUT|::set-output")
+_INPUT_EXPR_RE = re.compile(r"\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}")
+_BLOCK_SCALAR_RE = re.compile(r"[|>][+-]?\d*\s*(?:#.*)?$")
 
 
-def _store_cache_step_cause(step: dict, earlier: list, doc: dict, job: dict) -> str | None:
-    """Why this `actions/cache` step's `path:` is the shared store, or None when it is not."""
+def _refs(pattern: re.Pattern[str], text: str) -> list[str]:
+    return [m.group("dot") or m.group("br") for m in pattern.finditer(text)]
+
+
+def _run_lines(run: str) -> list[str]:
+    """A `run:` body as logical lines: backslash continuations joined."""
+    return run.replace("\\\n", " ").splitlines()
+
+
+def _env_scope_values(*scopes) -> dict[str, str]:
+    """Env name -> value across workflow/job/step scopes, the most specific scope winning."""
+    values: dict[str, str] = {}
+    for scope in scopes:
+        if isinstance(scope, dict):
+            for key, value in scope.items():
+                if key in _META:
+                    continue
+                values[str(key)] = value if isinstance(value, str) else str(value)
+    return values
+
+
+class _StoreFlow:
+    """Which names and step ids carry the shared store path, as of the step being judged."""
+
+    def __init__(self, earlier: list, scopes: tuple) -> None:
+        self.names: set[str] = set()
+        self.ids: set[str] = set()
+        self.relocated = False
+        env = _env_scope_values(*scopes)
+        # A pod-provided store var overridden to something outside /var/cache/ci is not the shared store.
+        self.local_vars = {
+            key.lower()
+            for key, value in env.items()
+            if key.lower() in _STORE_ENV_NAMES and not _SHARED_ROOT_RE.search(value)
+        }
+        self.relocated = bool(self.local_vars)
+        self._settle_env(env)
+        for prior in earlier:
+            if isinstance(prior, dict):
+                self._take_run(prior)
+        self._settle_env(env)
+
+    def _settle_env(self, env: dict[str, str]) -> None:
+        """Env values can name a shared literal, a tainted step output or another tainted name;
+        a few passes settle chains like STORE -> CACHE_DIR."""
+        for _ in range(3):
+            before = len(self.names)
+            for key, value in env.items():
+                if key.lower() not in self.local_vars and self._value_is_shared(value):
+                    self.names.add(key)
+            if before == len(self.names):
+                break
+
+    def _value_is_shared(self, text: str) -> bool:
+        if _SHARED_ROOT_RE.search(text):
+            return True
+        if any(ref in self.ids for ref in _refs(_STEP_OUTPUT_REF_RE, text)):
+            return True
+        for ref in _refs(_ENV_NAME_REF_RE, text):
+            if ref in self.names:
+                return True
+            if ref.lower() in _STORE_ENV_NAMES and ref.lower() not in self.local_vars:
+                return True
+        return False
+
+    def _take_run(self, prior: dict) -> None:
+        run = prior.get("run")
+        if not isinstance(run, str):
+            return
+        for line in _run_lines(run):
+            for move in _STORE_RELOCATE_RE.finditer(line):
+                if not _SHARED_ROOT_RE.search(move.group("a") or move.group("b") or move.group("c") or ""):
+                    self.relocated = True
+            queried = _STORE_QUERY_RE.search(line) is not None and not self.relocated
+            carried = self._value_is_shared(line)
+            if not (queried or carried):
+                continue
+            # Only what this very line assigns from the store path carries it; a variable set on
+            # another line of the same step (CYPRESS_CACHE=...) does not.
+            self.names.update(_ASSIGNED_NAME_RE.findall(line))
+            if isinstance(prior.get("id"), str) and _OUTPUT_SINK_RE.search(line):
+                self.ids.add(prior["id"])
+
+    def line_cause(self, text: str) -> str | None:
+        """Why one line of an `actions/cache` path is the shared store, or None."""
+        literal = _SHARED_ROOT_RE.search(text)
+        if literal is not None:
+            return f"names the shared store (`{literal.group(0)}`)"
+        for ref in _refs(_STEP_OUTPUT_REF_RE, text):
+            if ref in self.ids:
+                return f"is the output of step `{ref}`, which reads the store path (`pnpm store path` / `npm config get cache`)"
+        for ref in _refs(_ENV_NAME_REF_RE, text):
+            if ref in self.names:
+                return f"is `${ref}`, which is set from the shared store path"
+            if ref.lower() in _STORE_ENV_NAMES and ref.lower() not in self.local_vars:
+                return f"is `${ref}`, which the pool points at the shared store"
+        return None
+
+
+def _store_cache_step_cause(
+    step: dict, earlier: list, doc: dict, job: dict, lines: list[str] | None = None
+) -> tuple[int | None, str] | None:
+    """(line, why) when this `actions/cache` step's `path:` is the shared store, else None.
+
+    `line` is the offending line of a multi-line `path:`, not the first one."""
     inputs = step.get("with") if isinstance(step.get("with"), dict) else {}
     path = inputs.get("path")
     if not isinstance(path, str) or not path.strip():
         return None
-    literal = _STORE_PATH_LITERAL_RE.search(path)
-    if literal is not None:
-        first = path.strip().splitlines()[0]
-        return f"caches `path: {first}`, which names the shared store (`{literal.group(0)}`)"
-    query_ids: set[str] = set()
-    store_names: set[str] = set()
-    for scope in (doc.get("env"), job.get("env"), step.get("env")):
-        if isinstance(scope, dict):
-            for key, value in scope.items():
-                if isinstance(value, str) and _STORE_PATH_LITERAL_RE.search(value):
-                    store_names.add(str(key))
-    for prior in earlier:
-        run = prior.get("run") if isinstance(prior, dict) else None
-        if isinstance(run, str) and _STORE_QUERY_RE.search(run):
-            if isinstance(prior.get("id"), str):
-                query_ids.add(prior["id"])
-            store_names.update(_ASSIGNED_NAME_RE.findall(run))
-    for ref in _STEP_OUTPUT_REF_RE.findall(path):
-        if ref in query_ids:
-            return f"caches the output of step `{ref}`, which runs `pnpm store path` / `npm config get cache`"
-    for ref in _ENV_NAME_REF_RE.findall(path):
-        if ref in store_names:
-            return f"caches `${ref}`, which is set from the shared store path"
+    flow = _StoreFlow(earlier, (doc.get("env"), job.get("env"), step.get("env")))
+    key_line = _key_line(inputs, "path")
+    block = (
+        key_line is not None
+        and lines is not None
+        and key_line <= len(lines)
+        and _BLOCK_SCALAR_RE.search(lines[key_line - 1].strip()) is not None
+    )
+    for index, raw in enumerate(path.splitlines()):
+        text = raw.strip()
+        if not text or text.startswith(("!", "#")):
+            continue
+        why = flow.line_cause(text)
+        if why is not None:
+            line = None if key_line is None else key_line + (1 + index if block else 0)
+            return line, f"caches `path: {text}`, which {why}"
     return None
 
 
@@ -987,16 +1124,40 @@ def _auto_cache_enabled(value) -> bool:
     return text.upper() in ("", "TRUE")
 
 
-def _root_package_manager(repo_root: Path | None) -> str | None:
-    """The root package.json's `packageManager`, which is all setup-node v5 reads."""
+def _root_package_json(repo_root: Path | None) -> dict | None:
+    """The root package.json, which is all setup-node's auto-caching reads."""
     if repo_root is None:
         return None
     try:
         data = json.loads((Path(repo_root) / "package.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    value = data.get("packageManager") if isinstance(data, dict) else None
-    return value if isinstance(value, str) else None
+    return data if isinstance(data, dict) else None
+
+
+_NPM_MANAGER_RE = re.compile(r"^\^?npm(?:@.*)?$")
+
+
+def _auto_cached_manager(major: int, package: dict | None) -> str | None:
+    """'npm' or 'pnpm' when setup-node `major` auto-caches it for this package.json, else None.
+
+    Read from the action's own source. v5 matched `^\\^?(npm|yarn|pnpm)@` on `packageManager`. v6
+    (actions/setup-node#1374) and v7 narrowed it to npm: `packageManager` of `npm`, `npm@...` or
+    `^npm@...`, or a `devEngines.packageManager` entry (object or array) named the same way.
+    """
+    if not isinstance(package, dict) or major < 5:
+        return None
+    top = package.get("packageManager")
+    if major == 5:
+        match = re.match(r"^\^?(npm|yarn|pnpm)@", top) if isinstance(top, str) else None
+        return match.group(1) if match and match.group(1) != "yarn" else None
+    dev = package.get("devEngines")
+    dev = dev.get("packageManager") if isinstance(dev, dict) else None
+    entries = dev if isinstance(dev, list) else ([dev] if dev else [])
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str) and _NPM_MANAGER_RE.match(entry["name"]):
+            return "npm"
+    return "npm" if isinstance(top, str) and _NPM_MANAGER_RE.match(top) else None
 
 
 _PNPM_CACHE_EXEMPTION_HINT = (
@@ -1004,6 +1165,242 @@ _PNPM_CACHE_EXEMPTION_HINT = (
     "hostPath — say so on the job or in the workflow header:  "
     f"# {WRITTEN_PNPM_CACHE_MARKER} <reason>"
 )
+
+_FIX_PNPM = (
+    "Delete `cache: pnpm` (and its `cache-dependency-path:`) from this step. The "
+    "pool's pnpm store is already warm at `/var/cache/ci/pnpm-store`; "
+    "`pnpm install --frozen-lockfile` reads it directly."
+)
+_FIX_NPM = (
+    "Delete `cache: npm` (and its `cache-dependency-path:`) from this step. The "
+    "pool's npm cache is already warm at `/var/cache/ci/npm` "
+    "(`npm_config_cache`); `npm ci` reads it directly."
+)
+_FIX_HAND = (
+    "Delete this `actions/cache` step. The pool's store is already warm at "
+    "`/var/cache/ci/pnpm-store` (npm: `/var/cache/ci/npm`); `pnpm install "
+    "--frozen-lockfile` reads it directly."
+)
+_FIX_AUTO = "Add `package-manager-cache: false` under this step's `with:`."
+
+
+class _Hit(NamedTuple):
+    line: int | None  # in the numbering of the file the step lives in
+    owner: str
+    cause: str
+    fix: str
+    shared: str  # "pnpm store" | "npm cache" | "package store"
+
+
+class _R6Context:
+    """What the step judge needs beyond the step: package.json (read once) and the repo root."""
+
+    def __init__(self, repo_root: Path | None) -> None:
+        self.repo_root = repo_root
+        self._package: dict | None = None
+        self._read = False
+
+    def package(self) -> dict | None:
+        if not self._read:
+            self._package = _root_package_json(self.repo_root)
+            self._read = True
+        return self._package
+
+
+def _step_hit(
+    step: dict, earlier: list, doc: dict, job: dict, lines: list[str], ctx: _R6Context, *, direct: bool = False
+) -> _Hit | None:
+    """Does this one step put the shared store through a cache restore/save?
+
+    `direct` is a composite action judged on its own: nothing is known about the runner, so only
+    what is wrong on ANY runner counts (a literal /var/cache/ci path, or a `cache:` forwarded from
+    an input whose default names pnpm/npm)."""
+    uses = step.get("uses")
+    if not isinstance(uses, str):
+        return None
+    uses = uses.strip()
+    inputs = step.get("with") if isinstance(step.get("with"), dict) else {}
+    uses_line = _key_line(step, "uses") or step.get(_NODE_START)
+    if _ACTIONS_CACHE_RE.match(uses):
+        found = _store_cache_step_cause(step, earlier, doc, job, lines)
+        if found is None:
+            return None
+        line, cause = found
+        if direct and not _SHARED_ROOT_RE.search(cause):
+            return None
+        return _Hit(line or _key_line(inputs, "path") or uses_line, "`actions/cache` step", cause, _FIX_HAND, "package store")
+    if direct:
+        return None
+    if _PNPM_ACTION_SETUP_RE.match(uses):
+        if "cache" not in inputs or not _truthy_input(inputs.get("cache")):
+            return None
+        return _Hit(
+            _key_line(inputs, "cache") or uses_line,
+            "`pnpm/action-setup` step",
+            f"sets `cache: {inputs.get('cache')}`",
+            "Delete `cache:` from this `pnpm/action-setup` step (and its `cache_dependency_path`). "
+            "The pool's pnpm store is already warm at `/var/cache/ci/pnpm-store`; "
+            "`pnpm install --frozen-lockfile` reads it directly.",
+            "pnpm store",
+        )
+    if not _SETUP_NODE_CACHE_RE.match(uses):
+        return None
+    owner = "`actions/setup-node` step"
+    cache = inputs.get("cache")
+    if _cache_names_pnpm(cache):
+        return _Hit(_key_line(inputs, "cache") or uses_line, owner, f"sets `cache: {cache}`", _FIX_PNPM, "pnpm store")
+    if _cache_names_npm(cache):
+        return _Hit(_key_line(inputs, "cache") or uses_line, owner, f"sets `cache: {cache}`", _FIX_NPM, "npm cache")
+    if isinstance(cache, str) and cache.strip():
+        return None
+    raw = lines[uses_line - 1] if uses_line and uses_line <= len(lines) else ""
+    major = _setup_node_major(uses, raw)
+    if major is None or major < 5 or not _auto_cache_enabled(inputs.get("package-manager-cache")):
+        return None
+    manager = _auto_cached_manager(major, ctx.package())
+    if manager is None:
+        return None
+    declared = (ctx.package() or {}).get("packageManager")
+    source = f"`packageManager: {declared}`" if isinstance(declared, str) else "`devEngines.packageManager`"
+    cause = (
+        f"uses setup-node v{major} with no `cache:` and `package-manager-cache` left on, and "
+        f"package.json says {source} — v{major} auto-caches {manager} in that case"
+    )
+    fix = _FIX_AUTO
+    if major == 5 and manager == "pnpm":
+        cause += " (v6 narrowed auto-caching to npm)"
+        fix = "Add `package-manager-cache: false` under this step's `with:`, or move to `actions/setup-node@v6` or later, which only auto-caches npm."
+    return _Hit(uses_line, owner, cause, fix, "pnpm store" if manager == "pnpm" else "npm cache")
+
+
+# ── composite actions ─────────────────────────────────────────────────────
+#
+# A pool job often reaches setup-node through a local composite
+# (`uses: ./.github/actions/setup`), where `cache:` is written in action.yml and the
+# workflow file the PR touches shows only the call. The call is therefore followed: the
+# composite's steps are judged as if they sat in the job, with `${{ inputs.x }}` replaced by
+# what the caller passes (or the input's default).
+
+_MAX_COMPOSITE_DEPTH = 3
+_LOCAL_ACTION_USES_RE = re.compile(r"^\./(?P<dir>(?!\.github/workflows/)[^@\s]+?)/?$")
+
+
+def _load_composite(repo_root: Path | None, rel_dir: str) -> tuple[dict, list[str], str] | None:
+    """(doc, source lines, repo-relative path) of a local composite action, or None."""
+    if repo_root is None:
+        return None
+    root = Path(repo_root).resolve()
+    for name in ("action.yml", "action.yaml"):
+        candidate = (root / rel_dir / name).resolve()
+        try:
+            relative = candidate.relative_to(root)
+            text = candidate.read_text(encoding="utf-8")
+            doc = yaml.load(text, Loader=_MarkedLoader)
+        except (OSError, ValueError, yaml.YAMLError):
+            continue
+        runs = doc.get("runs") if isinstance(doc, dict) else None
+        if isinstance(runs, dict) and runs.get("using") == "composite" and isinstance(runs.get("steps"), list):
+            return doc, text.splitlines(), relative.as_posix()
+    return None
+
+
+def _subst_inputs(node, values: dict):
+    """`${{ inputs.x }}` replaced throughout a step; a whole-value expression keeps its type."""
+    if isinstance(node, str):
+        whole = _INPUT_EXPR_RE.fullmatch(node.strip())
+        if whole is not None and whole.group(1) in values:
+            return values[whole.group(1)]
+        return _INPUT_EXPR_RE.sub(
+            lambda m: str(values[m.group(1)]) if m.group(1) in values else m.group(0), node
+        )
+    if isinstance(node, list):
+        return [_subst_inputs(item, values) for item in node]
+    if isinstance(node, dict):
+        return {k: (v if k in _META else _subst_inputs(v, values)) for k, v in node.items()}
+    return node
+
+
+def _composite_inputs(action: dict, passed: dict) -> dict:
+    declared = action.get("inputs") if isinstance(action.get("inputs"), dict) else {}
+    values: dict = {}
+    for name, spec in declared.items():
+        if name in _META:
+            continue
+        default = spec.get("default") if isinstance(spec, dict) else None
+        values[name] = default if default is not None else ""
+    for name, value in passed.items():
+        if name not in _META:
+            values[name] = value
+    return values
+
+
+def _step_hits(
+    step: dict,
+    earlier: list,
+    doc: dict,
+    job: dict,
+    lines: list[str],
+    ctx: _R6Context,
+    depth: int = 0,
+    seen: tuple = (),
+) -> list[_Hit]:
+    """Hits for one step, following a local composite action into its own steps.
+
+    Lines of a hit that came from inside a composite are None: they number another file, and the
+    finding anchors on the caller's `uses:` line instead (the action path and line are in `cause`)."""
+    direct = _step_hit(step, earlier, doc, job, lines, ctx)
+    if direct is not None:
+        return [direct]
+    uses = step.get("uses")
+    match = _LOCAL_ACTION_USES_RE.match(uses.strip()) if isinstance(uses, str) else None
+    if match is None or depth >= _MAX_COMPOSITE_DEPTH or match.group("dir") in seen:
+        return []
+    loaded = _load_composite(ctx.repo_root, match.group("dir"))
+    if loaded is None:
+        return []
+    action, action_lines, action_path = loaded
+    values = _composite_inputs(action, step.get("with") if isinstance(step.get("with"), dict) else {})
+    inner = [_subst_inputs(s, values) for s in action["runs"]["steps"] if isinstance(s, dict)]
+    hits: list[_Hit] = []
+    for position, inner_step in enumerate(inner):
+        for hit in _step_hits(
+            inner_step, list(earlier) + inner[:position], doc, job, action_lines, ctx, depth + 1, seen + (match.group("dir"),)
+        ):
+            where = f"{action_path}:{hit.line}" if hit.line else action_path
+            hits.append(
+                hit._replace(
+                    line=None,
+                    owner=f"`{uses.strip()}` composite action, whose {hit.owner} ({where})",
+                )
+            )
+    return hits
+
+
+def _r6_message(name: str, hit: _Hit) -> str:
+    base = (
+        f"Job `{name}` runs on the self-hosted pool and its {hit.owner} {hit.cause}. "
+        f"Every runner pod on a node shares one {hit.shared} through the `/var/cache/ci` "
+        "hostPath, so restoring the ~2 GB cache tarball over it races the installs of concurrent jobs"
+    )
+    if hit.shared == "npm cache":
+        return (
+            base
+            + " and can leave cached packages missing or half-written under them. The cache is "
+            "already warm, so the restore buys nothing on this pool."
+        )
+    if hit.shared == "pnpm store":
+        return (
+            base
+            + " and fails them with `ERR_PNPM_ENOENT ... copyfile /var/cache/ci/pnpm-store/v10/files/...`. "
+            "The store is already warm, so the restore buys nothing on this pool."
+        )
+    return (
+        base
+        + " and fails them (pnpm: `ERR_PNPM_ENOENT ... copyfile`). The store is already warm, so the "
+        "restore buys nothing on this pool. A save also uploads the whole shared directory, and a "
+        "restore of one can leave CAS names hard-linked to another file's bytes (a whole-store "
+        "restore did exactly that on 2026-11-11)."
+    )
 
 
 def _pnpm_cache_findings(
@@ -1017,8 +1414,7 @@ def _pnpm_cache_findings(
     if not jobs:
         return []
     header_span, job_spans = _marker_spans(lines, doc, jobs)
-    package_manager: str | None = None
-    package_manager_read = False
+    ctx = _R6Context(repo_root or _infer_repo_root(path))
     findings: list[Finding] = []
     for index, (name, job, job_start, _job_end) in enumerate(jobs):
         if not _pool_capable(job.get("runs-on"), doc, caller_values):
@@ -1029,108 +1425,92 @@ def _pnpm_cache_findings(
         for position, step in enumerate(steps):
             if not isinstance(step, dict):
                 continue
-            uses = step.get("uses")
-            if not isinstance(uses, str):
+            uses_line = _key_line(step, "uses") or step.get(_NODE_START)
+            for hit in _step_hits(step, steps[:position], doc, job, lines, ctx):
+                found = _r6_finding(path, lines, name, job, job_start, hit, uses_line, header_span, job_spans[index])
+                if found is not None:
+                    findings.append(found)
+    return findings
+
+
+def _r6_finding(
+    path: str,
+    lines: list[str],
+    name: str,
+    job: dict,
+    job_start: int,
+    hit: _Hit,
+    uses_line: int | None,
+    header_span: tuple[int, int],
+    job_span: tuple[int, int],
+) -> Finding | None:
+    line = hit.line or uses_line
+    exemption = _marker_state(lines, [header_span, job_span], _ALLOW_PNPM_CACHE_RE)
+    if exemption == "allowed":
+        return None
+    message = _r6_message(name, hit)
+    if exemption == "no-reason":
+        message = (
+            f"Job `{name}` is marked with `# {WRITTEN_PNPM_CACHE_MARKER}` but no reason "
+            "follows it, so the exemption does not apply. The reason is the whole point "
+            f"of the marker: it is what a reviewer reads. {message}"
+        )
+    anchor = _key_line(job, "runs-on") or job_start
+    return Finding(
+        file=path,
+        line=line,
+        rule=RULE_PNPM_STORE_CACHE,
+        message=message,
+        fix=f"{hit.fix}\n\n{_PNPM_CACHE_EXEMPTION_HINT}",
+        anchors=tuple(sorted({line, uses_line, job_start, anchor} - {None})),
+    )
+
+
+def _composite_action_findings(path: str, lines: list[str], doc: dict) -> list[Finding]:
+    """A composite action.yml linted on its own: only what is wrong whatever the caller's runner is.
+
+    That is a literal `/var/cache/ci` path in an `actions/cache` step. A `cache:` forwarded from an
+    input is judged against the input's default (a caller that passes nothing gets it); a literal
+    `cache: pnpm` is NOT reported here, because hosted callers may use the action correctly: it is
+    reported on the pool job that calls the action, by `_pnpm_cache_findings`."""
+    runs = doc.get("runs")
+    if not isinstance(runs, dict) or runs.get("using") != "composite" or not isinstance(runs.get("steps"), list):
+        return []
+    values = _composite_inputs(doc, {})
+    ctx = _R6Context(None)
+    findings: list[Finding] = []
+    steps = [s for s in runs["steps"] if isinstance(s, dict)]
+    for position, step in enumerate(steps):
+        resolved = _subst_inputs(step, values)
+        hit = _step_hit(resolved, steps[:position], doc, {}, lines, ctx, direct=True)
+        if hit is None:
+            forwarded = step.get("with", {}).get("cache") if isinstance(step.get("with"), dict) else None
+            if not (isinstance(forwarded, str) and _INPUT_EXPR_RE.search(forwarded)):
                 continue
-            inputs = step.get("with") if isinstance(step.get("with"), dict) else {}
-            step_line = step.get(_NODE_START)
-            uses_line = _key_line(step, "uses") or step_line
-            shared = "pnpm store"
-            cache = None
-            if _ACTIONS_CACHE_RE.match(uses.strip()):
-                hand_cause = _store_cache_step_cause(step, steps[:position], doc, job)
-                if hand_cause is None:
-                    continue
-                line = _key_line(inputs, "path") or uses_line
-                cause = hand_cause
-                fix = (
-                    "Delete this `actions/cache` step. The pool's store is already warm at "
-                    "`/var/cache/ci/pnpm-store` (npm: `/var/cache/ci/npm`); `pnpm install "
-                    "--frozen-lockfile` reads it directly."
-                )
-                shared = "package store"
-            elif not _SETUP_NODE_RE.match(uses.strip()):
+            hit = _step_hit(resolved, steps[:position], doc, {}, lines, ctx)
+            if hit is None or hit.shared == "package store":
                 continue
-            else:
-                cache = inputs.get("cache")
-            if shared == "package store":
-                pass
-            elif _cache_names_pnpm(cache):
-                line = _key_line(inputs, "cache") or uses_line
-                cause = f"sets `cache: {cache}`"
-                fix = (
-                    "Delete `cache: pnpm` (and its `cache-dependency-path:`) from this step. The "
-                    "pool's pnpm store is already warm at `/var/cache/ci/pnpm-store`; "
-                    "`pnpm install --frozen-lockfile` reads it directly."
-                )
-            elif _cache_names_npm(cache):
-                line = _key_line(inputs, "cache") or uses_line
-                cause = f"sets `cache: {cache}`"
-                fix = (
-                    "Delete `cache: npm` (and its `cache-dependency-path:`) from this step. The "
-                    "pool's npm cache is already warm at `/var/cache/ci/npm` "
-                    "(`npm_config_cache`); `npm ci` reads it directly."
-                )
-                shared = "npm cache"
-            elif not (isinstance(cache, str) and cache.strip()):
-                raw = lines[uses_line - 1] if uses_line and uses_line <= len(lines) else ""
-                major = _setup_node_major(uses, raw)
-                if major not in _AUTO_CACHE_PNPM_MAJORS:
-                    continue
-                if not _auto_cache_enabled(inputs.get("package-manager-cache")):
-                    continue
-                if not package_manager_read:
-                    package_manager = _root_package_manager(repo_root or _infer_repo_root(path))
-                    package_manager_read = True
-                if package_manager is None or not _PNPM_PACKAGE_MANAGER_RE.match(package_manager.strip()):
-                    continue
-                line = uses_line
-                cause = (
-                    f"uses setup-node v{major} with no `cache:` and `package-manager-cache` left "
-                    f"on, and package.json says `packageManager: {package_manager}` — v5 "
-                    "auto-caches pnpm in that case (v6 narrowed auto-caching to npm)"
-                )
-                fix = (
-                    "Add `package-manager-cache: false` under this step's `with:`, or move to "
-                    "`actions/setup-node@v6` or later, which only auto-caches npm."
-                )
-            else:
-                continue
-            exemption = _marker_state(lines, [header_span, job_spans[index]], _ALLOW_PNPM_CACHE_RE)
-            if exemption == "allowed":
-                continue
-            owner = "`actions/cache` step" if shared == "package store" else "`actions/setup-node` step"
-            message = (
-                f"Job `{name}` runs on the self-hosted pool and its {owner} "
-                f"{cause}. Every runner pod on a node shares one {shared} through the "
-                "`/var/cache/ci` hostPath, so restoring the ~2 GB cache tarball over it races the "
-                "installs of concurrent jobs and fails them with "
-                "`ERR_PNPM_ENOENT ... copyfile /var/cache/ci/pnpm-store/v10/files/...`. The store "
-                "is already warm, so the restore buys nothing on this pool."
+            hit = hit._replace(cause=f"forwards `cache: {forwarded}` and the input's default makes that `{(resolved.get('with') or {}).get('cache')}`")
+        if _marker_state(lines, [(1, len(lines))], _ALLOW_PNPM_CACHE_RE) == "allowed":
+            continue
+        uses_line = _key_line(step, "uses") or step.get(_NODE_START)
+        line = hit.line or uses_line
+        findings.append(
+            Finding(
+                file=path,
+                line=line,
+                rule=RULE_PNPM_STORE_CACHE,
+                message=(
+                    f"This composite action's {hit.owner} {hit.cause}. A job on the self-hosted pool "
+                    "that calls it restores or saves a cache over the `/var/cache/ci` store that every "
+                    "runner pod on the node shares, which races concurrent installs and can leave "
+                    "CAS names holding another file's bytes (a whole-store restore did exactly that "
+                    "on 2026-11-11)."
+                ),
+                fix=f"{hit.fix}\n\n{_PNPM_CACHE_EXEMPTION_HINT}",
+                anchors=tuple(sorted({line, uses_line} - {None})),
             )
-            if shared != "pnpm store":
-                message += (
-                    " A save also uploads the whole shared directory, and a restore of one can "
-                    "leave CAS names hard-linked to another file's bytes (a whole-store restore "
-                    "did exactly that on 2026-11-11)."
-                )
-            if exemption == "no-reason":
-                message = (
-                    f"Job `{name}` is marked with `# {WRITTEN_PNPM_CACHE_MARKER}` but no reason "
-                    "follows it, so the exemption does not apply. The reason is the whole point "
-                    f"of the marker: it is what a reviewer reads. {message}"
-                )
-            anchor = _key_line(job, "runs-on") or job_start
-            findings.append(
-                Finding(
-                    file=path,
-                    line=line,
-                    rule=RULE_PNPM_STORE_CACHE,
-                    message=message,
-                    fix=f"{fix}\n\n{_PNPM_CACHE_EXEMPTION_HINT}",
-                    anchors=tuple(sorted({line, uses_line, job_start, anchor})),
-                )
-            )
+        )
     return findings
 
 
@@ -1236,6 +1616,10 @@ def _infer_repo_root(path: str) -> Path | None:
     parts = Path(path).resolve().parts
     if len(parts) >= 3 and parts[-2] == "workflows" and parts[-3] == ".github":
         return Path(*parts[:-3])
+    # a composite action: <root>/.github/actions/<name>/action.yml
+    anchors = [i for i, part in enumerate(parts[:-1]) if part == ".github"]
+    if anchors:
+        return Path(*parts[: anchors[-1]])
     return None
 
 
@@ -1630,6 +2014,7 @@ def lint_text(
     findings += _pnpm_cache_findings(
         path, lines, doc, Path(repo_root) if repo_root is not None else None, caller_values
     )
+    findings += _composite_action_findings(path, lines, doc)
     return findings
 
 

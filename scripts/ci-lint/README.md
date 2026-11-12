@@ -349,35 +349,51 @@ the shared lane immune.
 
 ### `pnpm-store-cache`
 
-A job on the self-hosted pool whose `actions/setup-node` step restores the
-pnpm or npm cache, or whose `actions/cache` step caches the node's shared store,
-is reported. Four shapes count:
+A job on the self-hosted pool that restores or saves a cache over the node's shared
+package store is reported. Every ARC scale set mounts the node's `/var/cache/ci`
+hostPath into its runner pods and points pnpm and npm at it
+(`npm_config_store_dir=/var/cache/ci/pnpm-store`, `npm_config_cache=/var/cache/ci/npm`),
+so every concurrent job on a node shares one pnpm store and one npm cache, and both are
+already warm. Seven shapes count:
 
-- **`cache: pnpm`**, in any spelling, or as a branch of the one
-  `${{ A && 'x' || 'y' }}` ternary the linter resolves; and
-- **setup-node v5's automatic pnpm cache**: a `@v5`/`@v5.x.y` step (or a sha
-  pin whose comment says `# v5…`) with no `cache:` input,
-  `package-manager-cache` left at its default, and a root `package.json` whose
-  `packageManager` is `pnpm@…`.
+- **`cache: pnpm`** on `actions/setup-node`, in any spelling, or as a branch of the one
+  `${{ A && 'x' || 'y' }}` ternary the linter resolves;
+- **`cache: npm`** on `actions/setup-node`: `npm config get cache` answers
+  `/var/cache/ci/npm` on the pool;
+- **`cache:` truthy on `pnpm/action-setup`** (any version);
+- **setup-node's automatic cache**: a `@v5`+ step (or a sha pin whose comment says `# v5…`)
+  with no `cache:` input and `package-manager-cache` left at its default, where the root
+  `package.json` makes setup-node pick pnpm or npm (table below);
+- **an `actions/cache` step, or a fork** (`<owner>/cache`, `/restore`, `/save`: `useblacksmith/cache`,
+  `runs-on/cache`, …; matched case-insensitively), **whose `path:`** names `/var/cache/ci`, or is the
+  `npm_config_store_dir` / `npm_config_cache` the pool sets, unless the workflow overrides it to a
+  directory outside `/var/cache/ci`;
+- the same, **reaching the path through an indirection**: `${{ steps.<id>.outputs.x }}`
+  (also `steps.<id>.outputs['x']` and `steps['<id>'].outputs.x`) or `${{ env.X }}` / `env['X']` / `$X`
+  set from an earlier `pnpm store path`, `pnpm config get store-dir`, `npm config get cache` or
+  `npm get cache` (flags between the words are fine), including `GITHUB_ENV` handed on through
+  `GITHUB_OUTPUT`, an env value built from a step output, and workflow, job or step `env:`;
+- **a local composite action** (`uses: ./.github/actions/x`) called from a pool job: its
+  steps are judged as if they sat in the job, with `${{ inputs.x }}` replaced by what the caller
+  passes or the input's default (up to three levels deep). The finding is anchored on the caller's
+  `uses:` line and names the action file and line.
 
-- **`cache: npm`**: `npm config get cache` answers `/var/cache/ci/npm` on the pool
-  (`npm_config_cache`), so the same tar restore/save hits the shared npm cache; and
-- **an `actions/cache` (or `/restore`, `/save`) step whose `path:`** names `/var/cache/ci`,
-  `npm_config_store_dir` or `npm_config_cache`, or is the output (`${{ steps.<id>.outputs.* }}`)
-  or env var (`${{ env.X }}`, `$X`) set from an earlier `pnpm store path` /
-  `pnpm config get store-dir` / `npm config get cache` step. A workspace-local `.pnpm-store`
-  is not shared and is not reported.
+A composite `action.yml` that a PR touches is also linted on its own, but only for what is wrong on
+any runner: an `actions/cache` step with a literal `/var/cache/ci` path, or a `cache:` forwarded from
+`${{ inputs.x }}` whose default is `pnpm` or `npm`. A literal `cache: pnpm` inside a composite is left
+to the pool job that calls it, because hosted callers may use the same action correctly.
+
+What does not count, because it is not the shared store: a workspace-local `.pnpm-store`, a path
+under `~`, a store env var pointed at `${{ github.workspace }}/…` or `$GITHUB_WORKSPACE/…`, a
+`pnpm config set store-dir <workspace path>` before the query, and a variable that merely sits in the
+same `run:` as a store query but is not assigned from it. Path lines starting with `!` are exclusions.
 
 A whole-store save uploads ~2 GB of the shared directory, and a later restore rewrites it in
 place. On 2026-11-11 that left six CAS names on forth hard-linked to another file's bytes
 (`nlink` 2, wrong sha512), i.e. silent wrong content for later installs, not just a race.
 
-Every ARC scale set mounts the node's `/var/cache/ci` hostPath into its runner
-pods and points pnpm at it (`npm_config_store_dir=/var/cache/ci/pnpm-store`),
-so every concurrent job on a node shares one pnpm store, and it is already
-warm. `cache: pnpm` asks `pnpm store path`, gets that shared directory, and on a
-hit extracts a ~2 GB tarball over it while sibling pods are linking out of the
-same files. The siblings fail with
+`cache: pnpm` asks `pnpm store path`, gets that shared directory, and on a hit extracts a ~2 GB
+tarball over it while sibling pods are linking out of the same files. The siblings fail with
 
 ```
 ERR_PNPM_ENOENT  ENOENT: no such file or directory, copyfile '/var/cache/ci/pnpm-store/v10/files/...'
@@ -394,19 +410,25 @@ On the pool the cache buys nothing, so the fix is to drop it:
           # no `cache: pnpm`, no `cache-dependency-path:` — the store is on the node
 ```
 
-**Why v5 and only v5 for the implicit form.** Read from the action's source,
-not its docs:
+**setup-node's automatic caching, by version.** Read from the action's source
+(`src/main.ts`, `getNameFromPackageManagerField`), not its docs:
 
 | setup-node | automatic caching (no `cache:` input) |
 |---|---|
 | v4 and below | none — `package-manager-cache` does not exist |
-| v5.x | on by default for whichever of `npm`/`yarn`/`pnpm` the root `packageManager` names (`^(?:\^)?(npm\|yarn\|pnpm)@`) |
-| v6.0.0+ | npm only — "Limit automatic caching to npm", actions/setup-node#1374; v7 unchanged |
+| v5.x | on by default for whichever of `npm`/`yarn`/`pnpm` the root `packageManager` names (`^(?:\^)?(npm\|yarn\|pnpm)@`); this rule reports pnpm and npm |
+| v6.0.0+, v7 | npm only — "Limit automatic caching to npm", actions/setup-node#1374: `packageManager` of `npm`, `npm@…` or `^npm@…`, or a `devEngines.packageManager` entry (object or array) named `npm`. **pnpm is not auto-cached on v6+.** |
 
-So a v5 step on a pnpm repository restores the shared store without ever
-saying `pnpm`. Fix it with `package-manager-cache: false` or by moving to v6+.
-The root `package.json` is read from the checkout being linted; when it cannot
-be read the implicit form is not reported.
+So a v5 step on a pnpm repository restores the shared store without ever saying `pnpm`, and a
+v5/v6/v7 step on an npm repository restores the shared npm cache. Fix it with
+`package-manager-cache: false` (or, for v5 on pnpm, by moving to v6+). The root `package.json`
+is read from the checkout being linted; when it cannot be read the implicit form is not reported.
+
+**What this rule guards, and what it does not.** It runs on pull requests, on the files and lines
+the PR touches. It stops *new* edits only. It does not stop a stale branch, or a default branch
+that already has the pattern, and it cannot stop the corrupting job from running. Detection of the
+damage is the job of the `ci-store-watchdog` timer on each node (multi-link files in the store, or a
+bulk in-place rewrite).
 
 Scope, deliberately narrow:
 
@@ -418,6 +440,7 @@ Scope, deliberately narrow:
   dokploy-community use it there and are not flagged.
 - **an unresolvable `runs-on:` or `cache:` expression is not reported**, and
   neither is a sha pin with no version comment.
+- a composite action in another repository (`owner/repo/path@ref`) is not followed.
 
 Exempt with `# ci-lint: allow-pnpm-cache <reason>` on the job or in the
 workflow header — a scale set whose store is NOT the shared hostPath, say.
